@@ -28,6 +28,26 @@ NEX introduces:
 
 ---
 
+## Threat Model
+
+NEX assumes:
+
+- Autonomous agents may execute dynamically generated code.
+- Agents may request filesystem and network access.
+- Agents may spawn concurrent tasks.
+- Agents may receive untrusted inputs.
+
+NEX enforces:
+
+- Explicit effect declarations (!io, !async)
+- Capability-based resource access (cap fs.read, etc.)
+- Deterministic return guarantees
+- Runtime capability guards
+
+The goal is to reduce uncontrolled side-effects
+in AI-driven execution environments.
+
+
 ## Example
 
 ```nex
