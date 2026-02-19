@@ -1,0 +1,5 @@
+// Must FAIL: tries to listen without capability
+
+fn main() !net {
+    listen_http(8080);
+}

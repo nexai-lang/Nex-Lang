@@ -1,0 +1,7 @@
+fn main(): void !async {
+  let t: task = spawn {
+    let x: bool = cancelled();
+    if x { print("cancelled"); }
+  };
+  cancel(t);
+}

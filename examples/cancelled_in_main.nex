@@ -1,0 +1,7 @@
+fn main() !io !async {
+  if cancelled() {
+    print("CANCELLED");
+  } else {
+    print("NOT CANCELLED");
+  }
+}

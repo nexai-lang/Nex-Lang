@@ -1,0 +1,7 @@
+// Must PASS: declares correct capability + effect
+
+cap net.listen(8080);
+
+fn main() !net {
+    listen_http(8080);
+}

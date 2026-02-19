@@ -1,0 +1,8 @@
+[package]
+name = "nex_out"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-util = "0.7"

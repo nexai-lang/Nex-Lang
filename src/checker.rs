@@ -1,0 +1,1177 @@
+// src/checker.rs
+use crate::ast::*;
+use std::collections::HashMap;
+
+#[derive(Debug, Clone)]
+pub struct CheckError {
+    pub message: String,
+    pub hint: Option<String>,
+    pub cause: Option<String>,
+    pub span: Option<Span>,
+    pub note_span: Option<Span>,
+    pub note: Option<String>,
+}
+
+impl std::fmt::Display for CheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.message)?;
+        if let Some(sp) = &self.span {
+            writeln!(f, "Location: line {}, col {}", sp.line, sp.col)?;
+        }
+        if let Some(c) = &self.cause {
+            writeln!(f, "Cause: {}", c)?;
+        }
+        if let Some(h) = &self.hint {
+            writeln!(f, "Hint: {}", h)?;
+        }
+        if let Some(sp) = &self.note_span {
+            writeln!(f, "Note location: line {}, col {}", sp.line, sp.col)?;
+        }
+        if let Some(n) = &self.note {
+            writeln!(f, "Note: {}", n)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckResult {
+    pub capabilities: Vec<Capability>,
+    pub neural_models: Vec<String>,
+    pub functions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DeclaredEffects {
+    io: bool,
+    net: bool,
+    r#async: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct EffectReported {
+    io: bool,
+    net: bool,
+    r#async: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MissingEffects {
+    io: bool,
+    net: bool,
+    r#async: bool,
+}
+
+impl MissingEffects {
+    fn any(&self) -> bool {
+        self.io || self.net || self.r#async
+    }
+
+    fn to_hint_list(&self) -> String {
+        let mut out: Vec<&'static str> = Vec::new();
+        if self.io {
+            out.push("`!io`");
+        }
+        if self.net {
+            out.push("`!net`");
+        }
+        if self.r#async {
+            out.push("`!async`");
+        }
+        out.join(", ")
+    }
+}
+
+// -------------------- Simple types (checker scope) --------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimpleType {
+    Void,
+    I32,
+    F32,
+    Bool,
+    String,
+    Task,
+    PoisonedTask,
+    Unknown,
+}
+
+fn simple_type_name(t: SimpleType) -> &'static str {
+    match t {
+        SimpleType::Void => "void",
+        SimpleType::I32 => "i32",
+        SimpleType::F32 => "f32",
+        SimpleType::Bool => "bool",
+        SimpleType::String => "string",
+        SimpleType::Task => "task",
+        SimpleType::PoisonedTask => "task (poisoned)",
+        SimpleType::Unknown => "unknown",
+    }
+}
+
+type TypeEnv = HashMap<String, SimpleType>;
+
+fn type_to_simple(t: &Type) -> Option<SimpleType> {
+    Some(match t {
+        Type::I32 => SimpleType::I32,
+        Type::F32 => SimpleType::F32,
+        Type::Bool => SimpleType::Bool,
+        Type::String => SimpleType::String,
+        Type::Task => SimpleType::Task,
+        Type::Named(_) => SimpleType::Unknown,
+    })
+}
+
+fn return_type_to_simple(rt: &Option<Type>) -> SimpleType {
+    match rt {
+        None => SimpleType::Void,
+        Some(t) => type_to_simple(t).unwrap_or(SimpleType::Unknown),
+    }
+}
+
+// ------------------------------
+// Step 52: Return analysis polish
+// ------------------------------
+//
+// From first principles: for a non-void function, *every* control-flow path must return a value.
+// We implement a conservative "always returns" analysis over blocks.
+//
+// Rules (V1):
+// - `return <expr>;` always returns
+// - `if {..} else {..}` always returns iff both branches always return
+// - `if {..}` without else never guarantees return
+// - `loop {..}` always returns iff its body always returns (i.e. first iteration must return)
+// - `defer {..}` does not change control flow
+fn block_always_returns(b: &Block) -> bool {
+    for s in &b.stmts {
+        if stmt_always_returns(s) {
+            return true; // remaining stmts unreachable
+        }
+    }
+    false
+}
+
+fn stmt_always_returns(s: &Stmt) -> bool {
+    match s {
+        Stmt::Return(_) => true,
+        Stmt::If { then_block, else_block, .. } => {
+            if let Some(eb) = else_block {
+                block_always_returns(then_block) && block_always_returns(eb)
+            } else {
+                false
+            }
+        }
+        Stmt::Loop(b) => block_always_returns(b),
+        // `defer` runs later; it doesn't force a return path.
+        Stmt::Defer(_) => false,
+        Stmt::Let { .. } | Stmt::Expr(_) => false,
+    }
+}
+
+
+// -------------------- Builtins table --------------------
+
+#[derive(Debug, Clone, Copy)]
+struct BuiltinSig {
+    params: &'static [SimpleType],
+    ret: SimpleType,
+    needs_io: bool,
+    needs_net: bool,
+    needs_async: bool,
+}
+
+fn builtin_sig(name: &str) -> Option<BuiltinSig> {
+    match name {
+        "print" => Some(BuiltinSig {
+            params: &[SimpleType::String],
+            ret: SimpleType::Void,
+            needs_io: true,
+            needs_net: false,
+            needs_async: false,
+        }),
+        "read_file" => Some(BuiltinSig {
+            params: &[SimpleType::String],
+            ret: SimpleType::String,
+            needs_io: true,
+            needs_net: false,
+            needs_async: false,
+        }),
+        "listen_http" => Some(BuiltinSig {
+            params: &[SimpleType::I32],
+            ret: SimpleType::Void,
+            needs_io: false,
+            needs_net: true,
+            needs_async: false,
+        }),
+        "sleep_ms" => Some(BuiltinSig {
+            params: &[SimpleType::I32],
+            ret: SimpleType::Void,
+            needs_io: false,
+            needs_net: false,
+            needs_async: true,
+        }),
+        "join" => Some(BuiltinSig {
+            params: &[SimpleType::Task],
+            ret: SimpleType::Void,
+            needs_io: false,
+            needs_net: false,
+            needs_async: true,
+        }),
+        "cancel" => Some(BuiltinSig {
+            params: &[SimpleType::Task],
+            ret: SimpleType::Void,
+            needs_io: false,
+            needs_net: false,
+            needs_async: true,
+        }),
+        "cancelled" => Some(BuiltinSig {
+            params: &[],
+            ret: SimpleType::Bool,
+            needs_io: false,
+            needs_net: false,
+            needs_async: true,
+        }),
+        _ => None,
+    }
+}
+
+// -------------------- Capability checks --------------------
+
+fn capability_sort_key(c: &Capability) -> String {
+    match c {
+        Capability::FsRead { glob } => format!("fs.read({})", glob),
+        Capability::NetListen { port } => format!("net.listen({})", port),
+    }
+}
+
+fn require_fs_read_capability(declared_caps: &[Capability], path: &str) -> Result<(), CheckError> {
+    for c in declared_caps {
+        if let Capability::FsRead { glob } = c {
+            // very simple glob: "*" matches all, otherwise exact match
+            if glob == "*" || glob == path {
+                return Ok(());
+            }
+        }
+    }
+    Err(CheckError {
+        message: format!("❌ Capability missing: need `cap fs.read(\"{}\")` (or `\"*\"`).", path),
+        hint: Some("Add: cap fs.read(\"*\"); (or a tighter glob)".to_string()),
+        cause: Some("missing capability".to_string()),
+        span: None,
+        note_span: None,
+        note: None,
+    })
+}
+
+fn require_net_listen_capability(declared_caps: &[Capability], port: i64) -> Result<(), CheckError> {
+    for c in declared_caps {
+        if let Capability::NetListen { port: p } = c {
+            if *p == port {
+                return Ok(());
+            }
+        }
+    }
+    Err(CheckError {
+        message: format!("❌ Capability missing: need `cap net.listen({})`.", port),
+        hint: Some(format!("Add: cap net.listen({});", port)),
+        cause: Some("missing capability".to_string()),
+        span: None,
+        note_span: None,
+        note: None,
+    })
+}
+
+// -------------------- Error rendering --------------------
+
+fn render_error_list(mut errs: Vec<CheckError>) -> CheckError {
+    // Keep deterministic ordering by span (line/col) when available, then message
+    errs.sort_by(|a, b| {
+        let ak = a.span.map(|s| (s.line, s.col)).unwrap_or((usize::MAX, usize::MAX));
+        let bk = b.span.map(|s| (s.line, s.col)).unwrap_or((usize::MAX, usize::MAX));
+        ak.cmp(&bk).then(a.message.cmp(&b.message))
+    });
+
+    let mut msg = String::new();
+    msg.push_str(&format!("❌ CHECK FAILED ({} error(s)).\n\n", errs.len()));
+    for (i, e) in errs.iter().enumerate() {
+        msg.push_str(&format!("---- Check Error {} ----\n", i + 1));
+        msg.push_str(&format!("{}\n", e.message));
+        if let Some(sp) = e.span {
+            msg.push_str(&format!("Location: line {}, col {}\n", sp.line, sp.col));
+        }
+        if let Some(h) = &e.hint {
+            msg.push_str(&format!("Hint: {}\n", h));
+        }
+        if let Some(c) = &e.cause {
+            msg.push_str(&format!("Cause: {}\n", c));
+        }
+        if let Some(sp) = e.note_span {
+            msg.push_str(&format!("Note location: line {}, col {}\n", sp.line, sp.col));
+        }
+        if let Some(n) = &e.note {
+            msg.push_str(&format!("Note: {}\n", n));
+        }
+        msg.push_str("\n");
+    }
+
+    CheckError {
+        message: msg,
+        hint: None,
+        cause: None,
+        span: None,
+        note_span: None,
+        note: None,
+    }
+}
+
+// -------------------- Step 45: User function signatures --------------------
+
+#[derive(Debug, Clone)]
+struct FnSig {
+    name_span: Span,
+    params: Vec<SimpleType>,
+    ret: SimpleType,
+    effects: DeclaredEffects,
+}
+
+fn effects_from_vec(effects: &[Effect]) -> DeclaredEffects {
+    DeclaredEffects {
+        io: effects.iter().any(|e| matches!(e, Effect::Io)),
+        net: effects.iter().any(|e| matches!(e, Effect::Net)),
+        r#async: effects.iter().any(|e| matches!(e, Effect::Async)),
+    }
+}
+
+fn union_effects(a: DeclaredEffects, b: DeclaredEffects) -> DeclaredEffects {
+    DeclaredEffects {
+        io: a.io || b.io,
+        net: a.net || b.net,
+        r#async: a.r#async || b.r#async,
+    }
+}
+
+fn missing_effects(required: DeclaredEffects, declared: DeclaredEffects) -> MissingEffects {
+    MissingEffects {
+        io: required.io && !declared.io,
+        net: required.net && !declared.net,
+        r#async: required.r#async && !declared.r#async,
+    }
+}
+
+// Step 46: infer transitive effects via call graph (fixed point)
+fn collect_direct_effects_and_calls_block(b: &Block, direct: &mut DeclaredEffects, calls: &mut Vec<String>) {
+    for s in &b.stmts {
+        collect_direct_effects_and_calls_stmt(s, direct, calls);
+    }
+}
+
+fn collect_direct_effects_and_calls_stmt(s: &Stmt, direct: &mut DeclaredEffects, calls: &mut Vec<String>) {
+    match s {
+        Stmt::Let { value, .. } => collect_direct_effects_and_calls_expr(value, direct, calls),
+        Stmt::Return(e) => collect_direct_effects_and_calls_expr(e, direct, calls),
+        Stmt::Expr(e) => collect_direct_effects_and_calls_expr(e, direct, calls),
+        Stmt::If { cond, then_block, else_block } => {
+            collect_direct_effects_and_calls_expr(cond, direct, calls);
+            collect_direct_effects_and_calls_block(then_block, direct, calls);
+            if let Some(b) = else_block {
+                collect_direct_effects_and_calls_block(b, direct, calls);
+            }
+        }
+        Stmt::Loop(b) => collect_direct_effects_and_calls_block(b, direct, calls),
+        Stmt::Defer(b) => collect_direct_effects_and_calls_block(b, direct, calls),
+    }
+}
+
+fn collect_direct_effects_and_calls_expr(e: &Expr, direct: &mut DeclaredEffects, calls: &mut Vec<String>) {
+    match e {
+        Expr::Literal(_) | Expr::Variable(_) => {}
+        Expr::BinaryOp { left, right, .. } => {
+            collect_direct_effects_and_calls_expr(left, direct, calls);
+            collect_direct_effects_and_calls_expr(right, direct, calls);
+        }
+        Expr::If { cond, then_block, else_block } => {
+            collect_direct_effects_and_calls_expr(cond, direct, calls);
+            collect_direct_effects_and_calls_block(then_block, direct, calls);
+            if let Some(b) = else_block {
+                collect_direct_effects_and_calls_block(b, direct, calls);
+            }
+        }
+        Expr::Block(b) => collect_direct_effects_and_calls_block(b, direct, calls),
+        Expr::Spawn { block, .. } => {
+            direct.r#async = true;
+            collect_direct_effects_and_calls_block(block, direct, calls);
+        }
+        Expr::Call { func, args, .. } => {
+            if let Some(sig) = builtin_sig(func) {
+                if sig.needs_io {
+                    direct.io = true;
+                }
+                if sig.needs_net {
+                    direct.net = true;
+                }
+                if sig.needs_async {
+                    direct.r#async = true;
+                }
+            } else {
+                calls.push(func.clone());
+            }
+            for a in args {
+                collect_direct_effects_and_calls_expr(a, direct, calls);
+            }
+        }
+    }
+}
+
+fn infer_transitive_effects(fn_bodies: &HashMap<String, Function>) -> HashMap<String, DeclaredEffects> {
+    let mut direct: HashMap<String, DeclaredEffects> = HashMap::new();
+    let mut calls: HashMap<String, Vec<String>> = HashMap::new();
+
+    for (name, f) in fn_bodies {
+        let mut d = DeclaredEffects::default();
+        let mut cs: Vec<String> = Vec::new();
+        collect_direct_effects_and_calls_block(&f.body, &mut d, &mut cs);
+        direct.insert(name.clone(), d);
+        calls.insert(name.clone(), cs);
+    }
+
+    let mut inferred = direct.clone();
+
+    loop {
+        let mut changed = false;
+
+        // clone keys for stable iteration
+        let keys: Vec<String> = inferred.keys().cloned().collect();
+
+        for name in keys {
+            let old = inferred.get(&name).copied().unwrap_or_default();
+            let mut new = old;
+
+            if let Some(cs) = calls.get(&name) {
+                for callee in cs {
+                    if let Some(req) = inferred.get(callee).copied() {
+                        new = union_effects(new, req);
+                    }
+                }
+            }
+
+            if new != old {
+                inferred.insert(name, new);
+                changed = true;
+            }
+        }
+
+        if !changed {
+            break;
+        }
+    }
+
+    inferred
+}
+
+fn build_fn_sigs(program: &Program) -> HashMap<String, FnSig> {
+    let mut out = HashMap::new();
+
+    for item in &program.items {
+        if let Item::Function(f) = item {
+            let mut ps: Vec<SimpleType> = Vec::new();
+            for p in &f.params {
+                let st = type_to_simple(&p.ty).unwrap_or(SimpleType::Unknown);
+                ps.push(st);
+            }
+
+            let sig = FnSig {
+                name_span: f.name_span,
+                params: ps,
+                ret: return_type_to_simple(&f.return_type),
+                effects: effects_from_vec(&f.effects),
+            };
+
+            out.insert(f.name.clone(), sig);
+        }
+    }
+
+    out
+}
+
+fn infer_expr_type(e: &Expr, env: &TypeEnv, fn_sigs: &HashMap<String, FnSig>) -> SimpleType {
+    match e {
+        Expr::Literal(Literal::Int(_)) => SimpleType::I32,
+        Expr::Literal(Literal::Bool(_)) => SimpleType::Bool,
+        Expr::Literal(Literal::String(_)) => SimpleType::String,
+        Expr::Literal(Literal::Float(_)) => SimpleType::Unknown,
+
+        Expr::Variable(v) => env.get(v).copied().unwrap_or(SimpleType::Unknown),
+
+        Expr::Spawn { .. } => SimpleType::Task,
+
+        Expr::Call { func, .. } => {
+            if let Some(sig) = builtin_sig(func) {
+                return sig.ret;
+            }
+            if let Some(fs) = fn_sigs.get(func) {
+                return fs.ret;
+            }
+            SimpleType::Unknown
+        }
+
+        Expr::BinaryOp { .. } => SimpleType::Unknown,
+        Expr::If { .. } => SimpleType::Unknown,
+        Expr::Block(_) => SimpleType::Unknown,
+    }
+}
+
+// -------------------- Public entry --------------------
+
+pub fn check(program: &Program) -> Result<CheckResult, CheckError> {
+    let mut caps: Vec<Capability> = Vec::new();
+    let mut models: Vec<String> = Vec::new();
+    let mut funcs: Vec<String> = Vec::new();
+
+    let fn_sigs = build_fn_sigs(program);
+
+    let mut fn_bodies: HashMap<String, Function> = HashMap::new();
+    for item in &program.items {
+        match item {
+            Item::Capability(c) => caps.push(c.cap.clone()),
+            Item::Neural(n) => models.push(n.name.clone()),
+            Item::Function(f) => {
+                funcs.push(f.name.clone());
+                fn_bodies.insert(f.name.clone(), f.clone());
+            }
+        }
+    }
+
+    caps.sort_by(|a, b| capability_sort_key(a).cmp(&capability_sort_key(b)));
+    models.sort();
+    funcs.sort();
+
+    if !fn_bodies.contains_key("main") {
+        return Err(CheckError {
+            message: "❌ Program has no `fn main()` entrypoint.".to_string(),
+            hint: Some("Add: fn main() { ... }".to_string()),
+            cause: None,
+            span: None,
+            note_span: None,
+            note: None,
+        });
+    }
+
+    let mut all_errors: Vec<CheckError> = Vec::new();
+
+    // -------------------- Step 46: signature must cover transitive effects --------------------
+    // We infer the minimal required effects from each function body plus callees.
+    let inferred_effects = infer_transitive_effects(&fn_bodies);
+
+    // Validate each function signature includes all required effects.
+    for fn_name in &funcs {
+        let f = fn_bodies.get(fn_name).unwrap();
+        let declared = fn_sigs
+            .get(fn_name)
+            .map(|s| s.effects)
+            .unwrap_or_default();
+
+        let required = inferred_effects.get(fn_name).copied().unwrap_or_default();
+        let miss = missing_effects(required, declared);
+
+        if miss.any() {
+            let list = miss.to_hint_list();
+            all_errors.push(CheckError {
+                message: format!(
+                    "❌ Missing effect declaration(s) in fn `{}` (required by its body and callees).",
+                    f.name
+                ),
+                hint: Some(format!("Add {} to the function signature.", list)),
+                cause: Some("transitive effects".to_string()),
+                span: None,
+                note_span: Some(f.name_span),
+                note: Some(format!("Add {} here.", list)),
+            });
+        }
+    }
+
+    for fn_name in &funcs {
+        let f = fn_bodies.get(fn_name).unwrap();
+        let declared = fn_sigs
+            .get(fn_name)
+            .map(|s| s.effects)
+            .unwrap_or_default();
+
+        let mut errs = check_function_collect(f, &caps, declared, &fn_sigs, &inferred_effects);
+        all_errors.append(&mut errs);
+    }
+
+    if !all_errors.is_empty() {
+        return Err(render_error_list(all_errors));
+    }
+
+    Ok(CheckResult {
+        capabilities: caps,
+        neural_models: models,
+        functions: funcs,
+    })
+}
+
+// -------------------- Function checking --------------------
+
+fn check_function_collect(
+    f: &Function,
+    declared_caps: &[Capability],
+    declared: DeclaredEffects,
+    fn_sigs: &HashMap<String, FnSig>,
+    inferred_effects: &HashMap<String, DeclaredEffects>,
+) -> Vec<CheckError> {
+    let mut reported = EffectReported::default();
+    let mut missing = MissingEffects::default();
+    let mut errs: Vec<CheckError> = Vec::new();
+    let mut env: TypeEnv = HashMap::new();
+
+    for p in &f.params {
+        let pname = p.name.clone();
+        let pty = type_to_simple(&p.ty).unwrap_or(SimpleType::Unknown);
+        if !pname.is_empty() {
+            env.insert(pname, pty);
+        }
+    }
+
+    let declared_ret: SimpleType = return_type_to_simple(&f.return_type);
+    let mut saw_return_stmt = false;
+
+    walk_block_collect(
+        &f.body,
+        declared_caps,
+        declared,
+        fn_sigs,
+        inferred_effects,
+        &mut reported,
+        &mut missing,
+        &mut env,
+        &mut errs,
+        f.name.clone(),
+        f.name_span,
+        declared_ret,
+        &mut saw_return_stmt,
+    );
+
+    if declared_ret != SimpleType::Void {
+        // Step 52: require "all paths return" for non-void functions.
+        if !block_always_returns(&f.body) {
+            errs.push(CheckError {
+                message: format!(
+                    "❌ Return error: fn `{}` declares a return type, but not all paths return a value.",
+                    f.name
+                ),
+                hint: Some("Ensure every `if` has an `else`, and all branches end with `return <expr>;`.".to_string()),
+                cause: Some("not all paths return".to_string()),
+                span: None,
+                note_span: Some(f.name_span),
+                note: Some("Add missing returns (or add an else-branch) so every path returns.".to_string()),
+            });
+        }
+    }
+
+    // NOTE: Step 46 now reports missing effects at the function signature level,
+    // so we intentionally do NOT emit a second summary here.
+    let _ = missing;
+
+    errs
+}
+
+fn walk_block_collect(
+    b: &Block,
+    declared_caps: &[Capability],
+    declared: DeclaredEffects,
+    fn_sigs: &HashMap<String, FnSig>,
+    inferred_effects: &HashMap<String, DeclaredEffects>,
+    reported: &mut EffectReported,
+    missing: &mut MissingEffects,
+    env: &mut TypeEnv,
+    errs: &mut Vec<CheckError>,
+    fn_name: String,
+    fn_name_span: Span,
+    declared_ret: SimpleType,
+    saw_return_stmt: &mut bool,
+) {
+    for s in &b.stmts {
+        walk_stmt_collect(
+            s,
+            declared_caps,
+            declared,
+            fn_sigs,
+            inferred_effects,
+            reported,
+            missing,
+            env,
+            errs,
+            fn_name.clone(),
+            fn_name_span,
+            declared_ret,
+            saw_return_stmt,
+        );
+    }
+}
+
+fn walk_stmt_collect(
+    s: &Stmt,
+    declared_caps: &[Capability],
+    declared: DeclaredEffects,
+    fn_sigs: &HashMap<String, FnSig>,
+    inferred_effects: &HashMap<String, DeclaredEffects>,
+    reported: &mut EffectReported,
+    missing: &mut MissingEffects,
+    env: &mut TypeEnv,
+    errs: &mut Vec<CheckError>,
+    fn_name: String,
+    fn_name_span: Span,
+    declared_ret: SimpleType,
+    saw_return_stmt: &mut bool,
+) {
+    match s {
+        Stmt::Let { name, ty, value } => {
+            let init_ty = infer_expr_type(value, env, fn_sigs);
+
+            if let Some(ann) = ty {
+                if let Some(want) = type_to_simple(ann) {
+                    if want == SimpleType::Task {
+                        if !matches!(value, Expr::Spawn { .. }) {
+                            errs.push(CheckError {
+                                message: format!(
+                                    "❌ Type error: `{}` is declared as `task` but is not initialized with `spawn {{ ... }}`.",
+                                    name
+                                ),
+                                hint: Some("Use: let t: task = spawn { ... };".to_string()),
+                                cause: Some("task must come from spawn".to_string()),
+                                span: None,
+                                note_span: Some(fn_name_span),
+                                note: Some("Declare task variables only from spawn.".to_string()),
+                            });
+                            env.insert(name.clone(), SimpleType::PoisonedTask);
+                            return;
+                        }
+                    }
+
+                    if want != SimpleType::Unknown
+                        && init_ty != SimpleType::Unknown
+                        && init_ty != want
+                    {
+                        errs.push(CheckError {
+                            message: format!(
+                                "❌ Type error: `{}` declared `{}` but initializer is `{}`.",
+                                name,
+                                simple_type_name(want),
+                                simple_type_name(init_ty)
+                            ),
+                            hint: Some("Fix the initializer or the declared type.".to_string()),
+                            cause: Some("type mismatch".to_string()),
+                            span: None,
+                            note_span: Some(fn_name_span),
+                            note: Some("Type mismatch in let binding.".to_string()),
+                        });
+                    }
+
+                    env.insert(name.clone(), want);
+                } else {
+                    env.insert(name.clone(), init_ty);
+                }
+            } else {
+                env.insert(name.clone(), init_ty);
+            }
+
+            walk_expr_collect(
+                value,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name.clone(),
+                fn_name_span,
+            );
+        }
+
+        Stmt::Return(expr) => {
+            *saw_return_stmt = true;
+
+            // Step 52: void functions (return_type: None) may not return a value.
+            if declared_ret == SimpleType::Void {
+                errs.push(CheckError {
+                    message: format!(
+                        "❌ Return error: fn `{}` is void (no return type) but contains `return <expr>;`.",
+                        fn_name
+                    ),
+                    hint: Some("Remove the return statement (end the function), or declare a return type and return a value.".to_string()),
+                    cause: Some("return in void function".to_string()),
+                    span: None,
+                    note_span: Some(fn_name_span),
+                    note: Some("Void in V1 is represented by omitting `: <type>` in the signature.".to_string()),
+                });
+            }
+
+
+            let got = infer_expr_type(expr, env, fn_sigs);
+            if declared_ret != SimpleType::Void
+                && got != SimpleType::Unknown
+                && declared_ret != SimpleType::Unknown
+                && got != declared_ret
+            {
+                errs.push(CheckError {
+                    message: format!(
+                        "❌ Return type error: fn `{}` declares `{}` but returned `{}`.",
+                        fn_name,
+                        simple_type_name(declared_ret),
+                        simple_type_name(got)
+                    ),
+                    hint: Some("Return a value matching the declared return type.".to_string()),
+                    cause: Some("return type mismatch".to_string()),
+                    span: None,
+                    note_span: Some(fn_name_span),
+                    note: Some("Fix the function return type or the returned expression.".to_string()),
+                });
+            }
+
+            walk_expr_collect(
+                expr,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name,
+                fn_name_span,
+            );
+        }
+
+        Stmt::Expr(expr) => {
+            walk_expr_collect(
+                expr,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name,
+                fn_name_span,
+            );
+        }
+
+        Stmt::If { cond, then_block, else_block } => {
+            walk_expr_collect(
+                cond,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name.clone(),
+                fn_name_span,
+            );
+            walk_block_collect(
+                then_block,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name.clone(),
+                fn_name_span,
+                declared_ret,
+                saw_return_stmt,
+            );
+            if let Some(b) = else_block {
+                walk_block_collect(
+                    b,
+                    declared_caps,
+                    declared,
+                    fn_sigs,
+                    inferred_effects,
+                    reported,
+                    missing,
+                    env,
+                    errs,
+                    fn_name,
+                    fn_name_span,
+                    declared_ret,
+                    saw_return_stmt,
+                );
+            }
+        }
+
+        Stmt::Loop(b) | Stmt::Defer(b) => walk_block_collect(
+            b,
+            declared_caps,
+            declared,
+            fn_sigs,
+            inferred_effects,
+            reported,
+            missing,
+            env,
+            errs,
+            fn_name,
+            fn_name_span,
+            declared_ret,
+            saw_return_stmt,
+        ),
+    }
+}
+
+fn walk_expr_collect(
+    e: &Expr,
+    declared_caps: &[Capability],
+    declared: DeclaredEffects,
+    fn_sigs: &HashMap<String, FnSig>,
+    inferred_effects: &HashMap<String, DeclaredEffects>,
+    reported: &mut EffectReported,
+    missing: &mut MissingEffects,
+    env: &mut TypeEnv,
+    errs: &mut Vec<CheckError>,
+    fn_name: String,
+    fn_name_span: Span,
+) {
+    match e {
+        Expr::Literal(_) | Expr::Variable(_) => {}
+
+        Expr::BinaryOp { left, right, .. } => {
+            walk_expr_collect(left, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span);
+            walk_expr_collect(right, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name, fn_name_span);
+        }
+
+        Expr::If { cond, then_block, else_block } => {
+            walk_expr_collect(cond, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span);
+            for s in &then_block.stmts {
+                walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+            }
+            if let Some(b) = else_block {
+                for s in &b.stmts {
+                    walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+                }
+            }
+        }
+
+        Expr::Block(b) => {
+            for s in &b.stmts {
+                walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+            }
+        }
+
+        Expr::Spawn { block, span } => {
+            if !declared.r#async {
+                missing.r#async = true;
+                if !reported.r#async {
+                    reported.r#async = true;
+                    errs.push(CheckError {
+                        message: "❌ Effect violation: `spawn { ... }` requires `!async` on the enclosing function.".to_string(),
+                        hint: Some("Add `!async` to the function signature.".to_string()),
+                        cause: Some("spawn".to_string()),
+                        span: Some(*span),
+                        note_span: Some(fn_name_span),
+                        note: Some("Add `!async` to this function signature.".to_string()),
+                    });
+                }
+            }
+            for s in &block.stmts {
+                walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+            }
+        }
+
+        Expr::Call { func, args, span } => {
+            // Builtins
+            if let Some(sig) = builtin_sig(func) {
+                enforce_effects(sig.needs_io, sig.needs_net, sig.needs_async, declared, reported, missing, errs, func, *span, fn_name_span);
+                enforce_call_arity_and_types(sig.params, func, args, env, fn_sigs, errs, *span, fn_name_span);
+            }
+            // User functions (Step 45 + Step 46 inferred effects)
+            else if let Some(sig) = fn_sigs.get(func) {
+                let req = inferred_effects.get(func).copied().unwrap_or(sig.effects);
+                enforce_effects(req.io, req.net, req.r#async, declared, reported, missing, errs, func, *span, fn_name_span);
+
+                if args.len() != sig.params.len() {
+                    errs.push(CheckError {
+                        message: format!("❌ Call error: `{}` expects {} argument(s) but got {}.", func, sig.params.len(), args.len()),
+                        hint: Some("Fix the call argument count.".to_string()),
+                        cause: Some(format!("call `{}`", func)),
+                        span: Some(*span),
+                        note_span: Some(fn_name_span),
+                        note: Some("Fix this call in the current function.".to_string()),
+                    });
+                } else {
+                    for (i, (arg, want)) in args.iter().zip(sig.params.iter()).enumerate() {
+                        let got = infer_expr_type(arg, env, fn_sigs);
+
+                        if *want == SimpleType::Task {
+                            if let Expr::Variable(v) = arg {
+                                if env.get(v).copied() == Some(SimpleType::PoisonedTask) {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        if *want != SimpleType::Unknown && got != SimpleType::Unknown && got != *want {
+                            errs.push(CheckError {
+                                message: format!(
+                                    "❌ Type error: arg {} of `{}` expected `{}` but got `{}`.",
+                                    i + 1,
+                                    func,
+                                    simple_type_name(*want),
+                                    simple_type_name(got)
+                                ),
+                                hint: Some("Fix the argument type.".to_string()),
+                                cause: Some(format!("call `{}`", func)),
+                                span: Some(*span),
+                                note_span: Some(fn_name_span),
+                                note: Some("Fix this call in the current function.".to_string()),
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Capability checks remain (read_file/listen_http)
+            if func == "read_file" && args.len() == 1 {
+                if let Expr::Literal(Literal::String(path)) = &args[0] {
+                    if let Err(mut e) = require_fs_read_capability(declared_caps, path) {
+                        e.span = Some(*span);
+                        e.note_span = Some(fn_name_span);
+                        e.note = Some("Add a matching capability and `!io` to this function.".to_string());
+                        errs.push(e);
+                    }
+                }
+            }
+            if func == "listen_http" && args.len() == 1 {
+                if let Expr::Literal(Literal::Int(port)) = &args[0] {
+                    if let Err(mut e) = require_net_listen_capability(declared_caps, *port) {
+                        e.span = Some(*span);
+                        e.note_span = Some(fn_name_span);
+                        e.note = Some("Add a matching capability and `!net` to this function.".to_string());
+                        errs.push(e);
+                    }
+                }
+            }
+
+            for a in args {
+                walk_expr_collect(a, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span);
+            }
+        }
+    }
+}
+
+fn enforce_effects(
+    needs_io: bool,
+    needs_net: bool,
+    needs_async: bool,
+    declared: DeclaredEffects,
+    reported: &mut EffectReported,
+    missing: &mut MissingEffects,
+    errs: &mut Vec<CheckError>,
+    func: &str,
+    call_span: Span,
+    fn_name_span: Span,
+) {
+    if needs_io && !declared.io {
+        missing.io = true;
+        if !reported.io {
+            reported.io = true;
+            errs.push(CheckError {
+                message: format!("❌ Effect violation: `{}` requires `!io` on the enclosing function.", func),
+                hint: Some("Add `!io` to the function signature.".to_string()),
+                cause: Some(format!("call `{}`", func)),
+                span: Some(call_span),
+                note_span: Some(fn_name_span),
+                note: Some("Add `!io` to this function signature.".to_string()),
+            });
+        }
+    }
+    if needs_net && !declared.net {
+        missing.net = true;
+        if !reported.net {
+            reported.net = true;
+            errs.push(CheckError {
+                message: format!("❌ Effect violation: `{}` requires `!net` on the enclosing function.", func),
+                hint: Some("Add `!net` to the function signature.".to_string()),
+                cause: Some(format!("call `{}`", func)),
+                span: Some(call_span),
+                note_span: Some(fn_name_span),
+                note: Some("Add `!net` to this function signature.".to_string()),
+            });
+        }
+    }
+    if needs_async && !declared.r#async {
+        missing.r#async = true;
+        if !reported.r#async {
+            reported.r#async = true;
+            errs.push(CheckError {
+                message: format!("❌ Effect violation: `{}` requires `!async` on the enclosing function.", func),
+                hint: Some("Add `!async` to the function signature.".to_string()),
+                cause: Some(format!("call `{}`", func)),
+                span: Some(call_span),
+                note_span: Some(fn_name_span),
+                note: Some("Add `!async` to this function signature.".to_string()),
+            });
+        }
+    }
+}
+
+fn enforce_call_arity_and_types(
+    params: &[SimpleType],
+    func: &str,
+    args: &[Expr],
+    env: &TypeEnv,
+    fn_sigs: &HashMap<String, FnSig>,
+    errs: &mut Vec<CheckError>,
+    call_span: Span,
+    fn_name_span: Span,
+) {
+    if args.len() != params.len() {
+        errs.push(CheckError {
+            message: format!("❌ Call error: `{}` expects {} argument(s) but got {}.", func, params.len(), args.len()),
+            hint: Some("Fix the call argument count.".to_string()),
+            cause: Some(format!("call `{}`", func)),
+            span: Some(call_span),
+            note_span: Some(fn_name_span),
+            note: Some("Fix this call in the current function.".to_string()),
+        });
+        return;
+    }
+
+    for (i, (arg, want)) in args.iter().zip(params.iter()).enumerate() {
+        let got = infer_expr_type(arg, env, fn_sigs);
+
+        if *want == SimpleType::Task {
+            if let Expr::Variable(v) = arg {
+                if env.get(v).copied() == Some(SimpleType::PoisonedTask) {
+                    continue;
+                }
+            }
+        }
+
+        if *want != SimpleType::Unknown && got != SimpleType::Unknown && got != *want {
+            errs.push(CheckError {
+                message: format!(
+                    "❌ Type error: arg {} of `{}` expected `{}` but got `{}`.",
+                    i + 1,
+                    func,
+                    simple_type_name(*want),
+                    simple_type_name(got)
+                ),
+                hint: Some("Fix the argument type.".to_string()),
+                cause: Some(format!("call `{}`", func)),
+                span: Some(call_span),
+                note_span: Some(fn_name_span),
+                note: Some("Fix this call in the current function.".to_string()),
+            });
+        }
+    }
+}

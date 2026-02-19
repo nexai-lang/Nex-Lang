@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN="./target/debug/nex"
+
+if [[ ! -f "$BIN" ]]; then
+  echo "[dev] building compiler..."
+  cargo build
+fi
+
+CMD="${1:-}"
+FILE="${2:-}"
+
+if [[ "$CMD" == "" || "$FILE" == "" ]]; then
+  echo "Usage:"
+  echo "  ./dev check <file.nex>"
+  echo "  ./dev run   <file.nex>"
+  exit 2
+fi
+
+"$BIN" "$CMD" "$FILE"

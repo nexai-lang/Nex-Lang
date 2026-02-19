@@ -1,0 +1,4 @@
+fn main() !io, async {
+  let t: task = spawn { print("hi"); };
+  join(t);
+}

@@ -1,0 +1,7 @@
+cap fs.read("sandbox_data/*");
+
+fn main() !io {
+    let content = read_file("sandbox_data/hello.txt");
+    print(content);
+    print("[NEX] Step 20: sync build has NO tokio.");
+}

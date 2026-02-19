@@ -1,0 +1,6 @@
+cap fs.read("allowed*.txt");
+
+fn main() !io {
+  let x = read_file("allowed1.txt");
+  print(x);
+}

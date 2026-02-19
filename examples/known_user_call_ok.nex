@@ -1,0 +1,7 @@
+fn helper() !io {
+  print("hi");
+}
+
+fn main() !io {
+  helper();
+}

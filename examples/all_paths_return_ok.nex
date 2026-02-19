@@ -1,0 +1,11 @@
+fn f(x: bool): int {
+  if x {
+    return 1;
+  } else {
+    return 2;
+  }
+}
+
+fn main() !io {
+  print("OK");
+}

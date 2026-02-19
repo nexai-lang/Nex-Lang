@@ -1,0 +1,7 @@
+fn is_ok(x: bool): bool {
+  return x;
+}
+
+fn main() {
+  let y: bool = is_ok(true);
+}

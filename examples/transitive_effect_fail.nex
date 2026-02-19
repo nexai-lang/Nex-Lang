@@ -1,0 +1,11 @@
+fn b(): void !io {
+  print("hi");
+}
+
+fn a(): void {
+  b();
+}
+
+fn main(): void {
+  a();
+}

@@ -1,0 +1,5 @@
+fn main() {
+  let x = 1
+  prnit("hi");
+  let y = 2;
+}

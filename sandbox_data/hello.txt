@@ -1,0 +1,1 @@
+Hello from sandbox_data/hello.txt (capability-secure read OK)

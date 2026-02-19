@@ -1,0 +1,6 @@
+fn main() {
+    // This is a comment
+    let x = 123;
+    let y = 4.5;
+    let ok = true;
+}

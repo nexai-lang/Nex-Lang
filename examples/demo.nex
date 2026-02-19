@@ -1,0 +1,23 @@
+cap fs.read("sandbox_data/*");
+cap net.listen(8080);
+
+fn main() !io,async,net {
+    let t = spawn {
+        print("Spawned task started.");
+        loop {
+            if cancelled() { break; }
+            print("tick");
+            sleep_ms(100);
+        }
+        print("Spawned task exiting cleanly.");
+    };
+
+    sleep_ms(350);
+    cancel(t);
+    join(t);
+
+    let content = read_file("sandbox_data/hello.txt");
+    print(content);
+
+    listen_http(8080);
+}
