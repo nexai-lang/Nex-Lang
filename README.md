@@ -1,11 +1,39 @@
 # NEX
 
-**Capability-safe, effect-typed AI-native programming language (Rust backend).**
+**Capability-safe, effect-typed programming language for secure autonomous systems.**
 
-NEX is designed for **secure autonomous systems**: programs must declare effects (e.g. `!io`, `!async`) and capabilities (e.g. `fs.read`, `net.listen`) to access sensitive operations.
+NEX is an experimental AI-native language designed to enforce **capability safety** and **effect declarations** at compile-time and runtime.
 
-## Demo
+It is built for a future where autonomous agents execute code, access files, spawn tasks, and interact with networks — without unrestricted system access.
 
-```bash
-./dev run examples/see_output.nex
-cargo test
+---
+
+## Why NEX?
+
+Modern AI systems frequently execute untrusted tools or dynamically generated code.
+
+Most programming languages provide:
+- Full file access
+- Full network access
+- No enforced effect boundaries
+
+NEX introduces:
+
+- 🔒 **Capability-based IO control**
+- ⚡ **Effect-typed functions (`!io`, `!async`)**
+- 🧠 **Deterministic return analysis**
+- 🔁 **Root cancellation tokens**
+- 🧵 **Async task primitives (`spawn`, `join`, `cancel`)**
+- 🦀 **Rust backend for safe execution**
+
+---
+
+## Example
+
+```nex
+cap fs.read("allowed.txt");
+
+fn main() !io {
+  let x = read_file("allowed.txt");
+  print(x);
+}
