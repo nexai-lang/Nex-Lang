@@ -1,11 +1,11 @@
-# NEX Language (V1)
+# NEX
 
-NEX is a small, AI-native programming language that compiles to Rust.  
-V1 focuses on **correctness**, **deterministic safety**, and a clean compiler pipeline.
+**Capability-safe, effect-typed AI-native programming language (Rust backend).**
 
-## Quick Start
+NEX is designed for **secure autonomous systems**: programs must declare effects (e.g. `!io`, `!async`) and capabilities (e.g. `fs.read`, `net.listen`) to access sensitive operations.
 
-Build the compiler:
+## Demo
 
 ```bash
-cargo build
+./dev run examples/see_output.nex
+cargo test
