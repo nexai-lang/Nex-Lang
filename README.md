@@ -73,3 +73,33 @@ fn main() !async {
     cancel(t);
     join(t);
 }
+```
+
+---
+
+## Structured Concurrency (v0.2.0)
+
+- Every `spawn` is attached to a parent task
+- Cancellation propagates to descendants
+- `join` waits for entire subtree
+- Parent exit triggers deterministic child cleanup
+- No orphaned tasks possible
+
+---
+
+## Compilation Pipeline
+
+Lexer → Parser → AST → Checker → Rust Codegen
+
+---
+
+## Roadmap
+
+- v0.2.0 — Structured concurrency (complete)
+- v0.3.0 — Capability patterns
+- v0.4.0 — Runtime limits
+- v0.5.0 — Module system
+- v1.0.0 — Stable execution kernel for autonomous systems
+
+
+Improve README for professional positioning
