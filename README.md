@@ -102,4 +102,4 @@ Lexer → Parser → AST → Checker → Rust Codegen
 - v1.0.0 — Stable execution kernel for autonomous systems
 
 
-Improve README for professional positioning
+
