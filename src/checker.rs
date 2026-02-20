@@ -368,7 +368,7 @@ fn collect_direct_effects_and_calls_block(b: &Block, direct: &mut DeclaredEffect
 fn collect_direct_effects_and_calls_stmt(s: &Stmt, direct: &mut DeclaredEffects, calls: &mut Vec<String>) {
     match s {
         Stmt::Let { value, .. } => collect_direct_effects_and_calls_expr(value, direct, calls),
-        Stmt::Return(e) => collect_direct_effects_and_calls_expr(e, direct, calls),
+        Stmt::Return(e) => { if let Some(ex) = e { collect_direct_effects_and_calls_expr(ex, direct, calls) } },
         Stmt::Expr(e) => collect_direct_effects_and_calls_expr(e, direct, calls),
         Stmt::If { cond, then_block, else_block } => {
             collect_direct_effects_and_calls_expr(cond, direct, calls);
@@ -791,7 +791,7 @@ fn walk_stmt_collect(
             );
         }
 
-        Stmt::Return(expr) => {
+        Stmt::Return(ret) => {
             *saw_return_stmt = true;
 
             // Step 52: void functions (return_type: None) may not return a value.
@@ -808,9 +808,8 @@ fn walk_stmt_collect(
                     note: Some("Void in V1 is represented by omitting `: <type>` in the signature.".to_string()),
                 });
             }
-
-
-            let got = infer_expr_type(expr, env, fn_sigs);
+            if let Some(expr) = ret {
+                let got = infer_expr_type(expr, env, fn_sigs);
             if declared_ret != SimpleType::Void
                 && got != SimpleType::Unknown
                 && declared_ret != SimpleType::Unknown
@@ -830,9 +829,8 @@ fn walk_stmt_collect(
                     note: Some("Fix the function return type or the returned expression.".to_string()),
                 });
             }
-
-            walk_expr_collect(
-                expr,
+                walk_expr_collect(
+                    expr,
                 declared_caps,
                 declared,
                 fn_sigs,
@@ -844,6 +842,7 @@ fn walk_stmt_collect(
                 fn_name,
                 fn_name_span,
             );
+            }
         }
 
         Stmt::Expr(expr) => {

@@ -1,0 +1,25 @@
+fn grandchild() : bool !async !io {
+  loop {
+    if cancelled() { print("grandchild_cancelled"); return true; }
+    sleep_ms(10);
+  }
+  return true;
+}
+
+fn child() : bool !async !io {
+  let g = spawn { grandchild(); };
+  loop {
+    if cancelled() { print("child_cancelled"); join(g); return true; }
+    sleep_ms(10);
+  }
+  return true;
+}
+
+fn main() : bool !async !io {
+  let c = spawn { child(); };
+  sleep_ms(40);
+  cancel(c);
+  join(c);
+  print("done");
+  return true;
+}

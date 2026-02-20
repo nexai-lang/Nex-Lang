@@ -1,12 +1,8 @@
-// src/ast.rs
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub line: usize,
     pub col: usize,
 }
-
-pub type Ident = String;
 
 #[derive(Debug, Clone)]
 pub struct Program {
@@ -25,7 +21,7 @@ pub struct Function {
     pub name: String,
     pub name_span: Span,
     pub params: Vec<Param>,
-    pub return_type: Option<Type>,
+    pub return_type: Option<Type>, // None => void
     pub effects: Vec<Effect>,
     pub body: Block,
 }
@@ -45,16 +41,23 @@ pub struct Block {
 pub enum Stmt {
     Let {
         name: String,
-        ty: Option<Type>, // ✅ Step 40 used by parser now
+        ty: Option<Type>,
         value: Expr,
     },
-    Return(Expr),
+
+    // v0.2.0: allow `return;` for void functions
+    // - Return(None) => `return;`
+    // - Return(Some(expr)) => `return expr;`
+    Return(Option<Expr>),
+
     Expr(Expr),
+
     If {
         cond: Expr,
         then_block: Block,
         else_block: Option<Block>,
     },
+
     Loop(Block),
     Defer(Block),
 }
@@ -141,12 +144,12 @@ pub struct NeuralDecl {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Type {
     I32,
     F32,
     Bool,
     String,
-    Task,          // ✅ Step 40: real task type
-    Named(String), // keep for future
+    Task,
+    Named(String),
 }

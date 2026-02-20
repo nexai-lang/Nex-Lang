@@ -1,0 +1,13 @@
+fn slow() : bool !async !io {
+  sleep_ms(60);
+  print("slow_done");
+  return true;
+}
+
+fn main() : bool !async !io {
+  let t = spawn { slow(); };
+  print("before_join");
+  join(t);
+  print("after_join");
+  return true;
+}

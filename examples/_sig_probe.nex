@@ -1,0 +1,8 @@
+fn worker() -> bool !io {
+  return true;
+}
+
+fn main() -> bool !io {
+  print("sig_ok");
+  return true;
+}

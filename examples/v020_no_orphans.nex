@@ -1,0 +1,22 @@
+fn leaf() : bool !async !io {
+  loop {
+    if cancelled() { print("leaf_cancelled"); return true; }
+    sleep_ms(10);
+  }
+  return true;
+}
+
+fn worker() : bool !async !io {
+  let x = spawn { leaf(); };
+  sleep_ms(20);
+  cancel(x);
+  join(x);
+  return true;
+}
+
+fn main() : bool !async !io {
+  let t = spawn { worker(); };
+  join(t);
+  print("done");
+  return true;
+}

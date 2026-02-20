@@ -1,0 +1,14 @@
+fn worker() : bool !async !io {
+  loop {
+    if cancelled() { print("child_cleanup_cancelled"); return true; }
+    sleep_ms(10);
+  }
+  return true;
+}
+
+fn main() : bool !async !io {
+  let t = spawn { worker(); };
+  sleep_ms(30);
+  print("parent_exiting");
+  return true;
+}

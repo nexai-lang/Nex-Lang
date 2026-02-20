@@ -358,7 +358,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::Return)?;
         let e = self.parse_expr()?;
         self.expect(Token::Semi)?;
-        Ok(Stmt::Return(e))
+        Ok(Stmt::Return(Some(e)))
     }
 
     fn parse_if_stmt(&mut self) -> PResult<Stmt> {

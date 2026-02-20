@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs / temp
+*.log
+*.tmp
+
+# NEX generated output (optional: keep it out of git)
+target/nex_out/
