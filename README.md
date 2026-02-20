@@ -1,59 +1,75 @@
 # NEX
 
-**Capability-safe, effect-typed programming language for secure autonomous systems.**
-
-NEX is an experimental AI-native language designed to enforce **capability safety** and **effect declarations** at compile-time and runtime.
-
-It is built for a future where autonomous agents execute code, access files, spawn tasks, and interact with networks — without unrestricted system access.
+> A deterministic, capability-safe, effect-typed systems language  
+> designed as a secure execution substrate for autonomous agents.
 
 ---
 
-## Why NEX?
+## Problem
 
-Modern AI systems frequently execute untrusted tools or dynamically generated code.
+Modern AI systems increasingly execute:
 
-Most programming languages provide:
-- Full file access
-- Full network access
+- Dynamically generated code
+- Untrusted tools
+- File system operations
+- Network operations
+- Concurrent tasks
+
+Most general-purpose languages provide:
+
+- Unrestricted filesystem access
+- Unrestricted networking
 - No enforced effect boundaries
+- Ad-hoc async cancellation
+- No deterministic task structure
 
-NEX introduces:
-
-- 🔒 **Capability-based IO control**
-- ⚡ **Effect-typed functions (`!io`, `!async`)**
-- 🧠 **Deterministic return analysis**
-- 🔁 **Root cancellation tokens**
-- 🧵 **Async task primitives (`spawn`, `join`, `cancel`)**
-- 🦀 **Rust backend for safe execution**
+This creates security, correctness, and isolation risks.
 
 ---
 
-## Threat Model
+## Design Goals
 
-NEX assumes:
+NEX is designed to provide:
 
-- Autonomous agents may execute dynamically generated code.
-- Agents may request filesystem and network access.
-- Agents may spawn concurrent tasks.
-- Agents may receive untrusted inputs.
+1. Compile-time capability enforcement
+2. Explicit effect declarations
+3. Deterministic structured concurrency
+4. Runtime enforcement mirroring compile-time policy
+5. Memory-safe execution via Rust backend
 
-NEX enforces:
+NEX is not a scripting language.
 
-- Explicit effect declarations (!io, !async)
-- Capability-based resource access (cap fs.read, etc.)
-- Deterministic return guarantees
-- Runtime capability guards
+It is a policy-enforced execution substrate.
 
-The goal is to reduce uncontrolled side-effects
-in AI-driven execution environments.
+---
 
+## Core Principles
+
+- No implicit side effects
+- No detached async execution
+- All I/O must be declared
+- All async must be declared
+- Capabilities must be explicitly granted
+- Parent-child task trees are enforced
+- Cancellation propagates deterministically
+
+---
 
 ## Example
 
 ```nex
-cap fs.read("allowed.txt");
+cap fs.read("config.txt");
 
-fn main() !io {
-  let x = read_file("allowed.txt");
-  print(x);
+fn worker() !async {
+    spawn {
+        if cancelled() {
+            return;
+        }
+    };
+}
+
+fn main() !async {
+    let t = spawn { worker(); };
+    cancel(t);
+    join(t);
 }
