@@ -19,11 +19,7 @@ Delete that entire block.
 
 # ✅ STEP 3 — Paste This Safe Version
 
-Paste this exactly:
-
 ````markdown
-## Compilation Pipeline
-
 ```mermaid
 flowchart TD
 
