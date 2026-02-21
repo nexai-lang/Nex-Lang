@@ -9,7 +9,6 @@ The compiler follows a strict multi-stage pipeline. Each stage has a single resp
 ## Compilation Pipeline
 
 ```mermaid
-flowchart TD
 ---
 flowchart TD
 
