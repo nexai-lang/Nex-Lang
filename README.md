@@ -191,3 +191,20 @@ NEX enforces authority at compile time:
 • No detached tasks (structured concurrency invariant)
 
 The compiler guarantees that generated programs cannot exceed declared authority.
+
+---
+
+## Documentation
+
+- [Architecture](docs/architecture.md)
+- [Runtime Model](docs/runtime.md)
+- [Security Model](docs/security.md)
+- [Language Specification](docs/spec.md)
+- [Versioning Policy](docs/versioning.md)
+- [Roadmap](docs/roadmap.md)
+- [Design Principles](docs/DESIGN.md)
+- [Governance](docs/GOVERNANCE.md)
+- [Contributing Guide](docs/CONTRIBUTING.md)
+- [RFC Process](docs/rfcs/0000-template.md)
+
+---
