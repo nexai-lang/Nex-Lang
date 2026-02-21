@@ -10,19 +10,35 @@ The compiler follows a strict multi-stage pipeline. Each stage has a single resp
 
 ```mermaid
 flowchart TD
+...
 
-    A[Source File (.nex)]
-    B[Lexer]
-    C[Parser]
-    D[Abstract Syntax Tree]
-    E[Semantic Checker]
-    F[Capability Validation]
-    G[Effect Enforcement]
-    H[Const Evaluation]
-    I[Structured Concurrency Validation]
-    J[Rust Code Generation]
-    K[Rust Compiler]
-    L[Executable Binary]
+
+Delete that entire block.
+
+---
+
+# ✅ STEP 3 — Paste This Safe Version
+
+Paste this exactly:
+
+````markdown
+## Compilation Pipeline
+
+```mermaid
+flowchart TD
+
+    A["Source File .nex"]
+    B["Lexer"]
+    C["Parser"]
+    D["Abstract Syntax Tree"]
+    E["Semantic Checker"]
+    F["Capability Validation"]
+    G["Effect Enforcement"]
+    H["Const Evaluation"]
+    I["Structured Concurrency Validation"]
+    J["Rust Code Generation"]
+    K["Rust Compiler"]
+    L["Executable Binary"]
 
     A --> B
     B --> C
@@ -35,7 +51,7 @@ flowchart TD
     I --> J
     J --> K
     K --> L
-```
+
 
 ---
 
