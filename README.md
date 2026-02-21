@@ -149,3 +149,45 @@ v1.0.0 → secure execution layer for NEXUS OS
 ## License
 
 Apache-2.0
+# Compiler Architecture
+
+NEX follows a deterministic, multi-stage compilation pipeline.
+
+```mermaid
+flowchart TD
+
+    A[.nex Source File]
+    B[Lexer]
+    C[Parser]
+    D[AST Construction]
+    E[Semantic Checker]
+    F[Capability Validation]
+    G[Effect Enforcement]
+    H[Code Generation - Rust Backend]
+    I[Rust Compilation]
+    J[Executable Binary]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+```
+
+---
+
+## Security Model
+
+NEX enforces authority at compile time:
+
+• Capabilities must be declared explicitly  
+• Effects must be declared at function boundaries  
+• Network ports must be statically provable  
+• File access must match declared glob patterns  
+• No detached tasks (structured concurrency invariant)
+
+The compiler guarantees that generated programs cannot exceed declared authority.
