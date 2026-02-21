@@ -4,14 +4,14 @@ NEX is a deterministic, capability-safe, effect-typed systems language designed 
 
 The compiler follows a strict multi-stage pipeline. Each stage has a single responsibility and produces a validated intermediate form.
 
----
+
 
 ## Compilation Pipeline
 
 ````markdown
 ```mermaid
 flowchart TD
-
+```
     A["Source File .nex"]
     B["Lexer"]
     C["Parser"]
