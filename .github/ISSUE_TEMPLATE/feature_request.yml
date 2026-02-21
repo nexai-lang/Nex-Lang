@@ -1,0 +1,57 @@
+name: "Feature request"
+description: Propose a feature, improvement, or new capability for NEX.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        NEX changes must preserve core invariants: determinism, explicit authority, structured concurrency, compile-time enforcement.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What pain point are you solving?
+      placeholder: "Today, it's hard to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the change and how it fits the language model.
+      placeholder: "Add ... so that ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Security & determinism impact
+      description: How does this affect authority boundaries, effects, or determinism?
+      placeholder: "This does not introduce ambient authority because ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: "Alternative A: ... (rejected because ...)"
+    validations:
+      required: false
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Example NEX code
+      render: text
+      placeholder: |
+        // Example usage:
+        fn main() {
+          ...
+        }
+    validations:
+      required: false
