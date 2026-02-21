@@ -2,27 +2,27 @@
 
 NEX is a deterministic, capability-safe, effect-typed systems language designed for secure autonomous execution.
 
-The compiler follows a strict multi-stage pipeline. Each stage has a single responsibility and produces a validated intermediate form.
+The compiler follows a strict multi-stage pipeline.  
+Each stage has a single responsibility and produces a validated intermediate form.
 
-
+---
 
 ## Compilation Pipeline
 
-````markdown
 ```mermaid
 flowchart TD
-```
-    A["Source File .nex"]
+
+    A["Source File (.nex)"]
     B["Lexer"]
     C["Parser"]
-    D["Abstract Syntax Tree"]
+    D["Abstract Syntax Tree (AST)"]
     E["Semantic Checker"]
     F["Capability Validation"]
     G["Effect Enforcement"]
     H["Const Evaluation"]
     I["Structured Concurrency Validation"]
     J["Rust Code Generation"]
-    K["Rust Compiler"]
+    K["Rust Compiler (cargo)"]
     L["Executable Binary"]
 
     A --> B
@@ -36,86 +36,147 @@ flowchart TD
     I --> J
     J --> K
     K --> L
-
+```
 
 ---
 
 ## Stage Responsibilities
 
 ### 1. Lexer
-Transforms raw source into tokens.
-Deterministic and span-aware for precise diagnostics.
+Transforms raw source text into structured tokens.
+
+- Deterministic tokenization
+- Span-aware for precise diagnostics
+- No implicit rewriting
+
+---
 
 ### 2. Parser
-Builds a structured AST.
-Ensures syntactic correctness before semantic analysis.
+Builds a strongly-typed Abstract Syntax Tree (AST).
+
+- Validates syntax correctness
+- Constructs structured program representation
+- Preserves span metadata
+
+---
 
 ### 3. Semantic Checker
-Validates:
+Performs static correctness validation.
+
+Ensures:
+
 - Type correctness
-- Function signatures
+- Function signature integrity
 - Deterministic return analysis
-- Builtin function contracts
+- Valid control flow
+
+---
 
 ### 4. Capability Validation
+Enforces explicit authority declaration.
+
 Ensures:
-- File access matches declared glob
-- Network ports match declared range
+
+- File access matches declared glob patterns
+- Network ports match declared numeric ranges
 - No implicit authority escalation
+- No undeclared resource access
+
+Example:
+
+```
+cap fs.read("logs/*.txt");
+cap net.listen(8000..9000);
+```
+
+---
 
 ### 5. Effect Enforcement
-Functions must explicitly declare:
+Functions must explicitly declare side effects.
+
+Supported effects:
+
 - `!io`
-- `!net`
 - `!async`
 
-Effects cannot be inferred implicitly across boundaries.
+Compile-time guarantees:
+
+- No hidden side effects
+- No implicit I/O
+- Pure functions remain pure
+
+---
 
 ### 6. Const Evaluation
-Statically evaluates:
-- Integer expressions
-- Const `let` bindings
-- Trivial pure functions returning constants
+Evaluates constant expressions at compile time.
 
-This enables provable capability enforcement.
+- Literal folding
+- Constant function resolution
+- Deterministic compile-time evaluation
+
+Rejects:
+
+- Dynamic authority computation
+- Non-deterministic const logic
+
+---
 
 ### 7. Structured Concurrency Validation
+Enforces deterministic task trees.
+
 Guarantees:
+
 - No detached tasks
-- Deterministic parent-child cancellation
-- Root task cleanup invariant
+- Parent-child task registry
+- Subtree cancellation propagation
+- Deterministic join semantics
+- Root cleanup at program exit
+
+---
 
 ### 8. Rust Code Generation
-Generates deterministic Rust code:
-- Runtime guards mirror compile-time policy
-- Capability allowlists embedded statically
-- No dynamic authority acquisition
+Generates safe Rust backend code.
+
+- Capability-safe wrappers
+- Effect-aware runtime scaffolding
+- Deterministic task runtime
+- Zero implicit privilege elevation
 
 ---
 
-## Core Guarantees
+### 9. Rust Compilation
+Uses Cargo to produce the final binary.
 
-NEX enforces at compile time:
-
-• Explicit effect typing  
-• Capability-based authority  
-• Static validation of network ports  
-• Path traversal blocking  
-• Deterministic structured concurrency  
-• No implicit runtime escalation  
-
-Runtime checks mirror compile-time guarantees.
+- Type-checked backend
+- Memory-safe execution
+- Deterministic runtime behavior
 
 ---
 
-## Design Philosophy
+# Core Design Principles
 
-NEX is built for environments where code may be generated dynamically (e.g., AI systems).
+NEX is built on the following invariants:
 
-Security must be:
+1. Determinism by default  
+2. Explicit authority model  
+3. Compile-time policy enforcement  
+4. Runtime behavior mirrors static guarantees  
+5. No hidden side effects  
+6. No implicit concurrency  
 
-- Deterministic
-- Verifiable
-- Statistically provable before execution
+---
 
-NEX is designed as a secure execution substrate for autonomous systems.
+# Architectural Philosophy
+
+NEX is not a scripting language.
+
+It is an execution substrate for autonomous systems, where:
+
+- Security is enforced by the type system  
+- Authority must be declared before use  
+- Concurrency is structured and bounded  
+- The compiler prevents privilege escalation  
+
+NEX is designed as a foundation for AI-native execution environments.
+
+---
