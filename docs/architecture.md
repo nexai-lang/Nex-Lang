@@ -11,7 +11,6 @@ The compiler follows a strict multi-stage pipeline. Each stage has a single resp
 ```mermaid
 flowchart TD
 ---
-```mermaid
 flowchart TD
 
     A["Source File .nex"]
