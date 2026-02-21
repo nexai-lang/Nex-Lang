@@ -1,1 +1,0 @@
-/home/nexus/NEXUS/nex-lang/nex/target/debug/nex: /home/nexus/NEXUS/nex-lang/nex/src/ast.rs /home/nexus/NEXUS/nex-lang/nex/src/checker.rs /home/nexus/NEXUS/nex-lang/nex/src/cli.rs /home/nexus/NEXUS/nex-lang/nex/src/codegen.rs /home/nexus/NEXUS/nex-lang/nex/src/lexer.rs /home/nexus/NEXUS/nex-lang/nex/src/main.rs /home/nexus/NEXUS/nex-lang/nex/src/parser.rs

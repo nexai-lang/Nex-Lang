@@ -1,0 +1,10 @@
+cap net.listen(8000..9000);
+
+fn get_port() : i32 {
+  return 8085;
+}
+
+fn main() !io !net {
+  let p = get_port();   // not const in v0.3.6
+  net.listen(p);        // should be rejected
+}

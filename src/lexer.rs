@@ -112,7 +112,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn current_span(&self) -> Span {
-        Span { line: self.line, col: self.col }
+        Span {
+            line: self.line,
+            col: self.col,
+        }
     }
 
     fn skip_ws_and_comments(&mut self) {
@@ -141,12 +144,24 @@ impl<'a> Lexer<'a> {
         while let Some(c) = self.peek() {
             if c.is_ascii_digit() {
                 s.push(self.bump().unwrap());
-            } else if c == '.' && !is_float {
+                continue;
+            }
+
+            // v0.3.3 fix:
+            // If we see ".." after an integer, that is a range operator, not a float.
+            // Example: 8000..9000 must lex as Int(8000) then Dot then Dot then Int(9000).
+            if c == '.' && !is_float {
+                if self.starts_with("..") {
+                    // Do NOT consume '.' here; leave it for the main token loop to emit Dot, Dot.
+                    break;
+                }
+                // Otherwise it's a normal float dot (e.g., 3.14)
                 is_float = true;
                 s.push(self.bump().unwrap());
-            } else {
-                break;
+                continue;
             }
+
+            break;
         }
 
         if is_float {
@@ -215,7 +230,10 @@ impl<'a> Lexer<'a> {
         let ch = match self.bump() {
             Some(c) => c,
             None => {
-                return LexToken { kind: Token::Eof, span: start };
+                return LexToken {
+                    kind: Token::Eof,
+                    span: start,
+                };
             }
         };
 
@@ -228,17 +246,37 @@ impl<'a> Lexer<'a> {
             ';' => Token::Semi,
             '.' => Token::Dot,
             '!' => {
-                if self.starts_with("=") { self.bump(); Token::Ne } else { Token::Bang }
+                if self.starts_with("=") {
+                    self.bump();
+                    Token::Ne
+                } else {
+                    Token::Bang
+                }
             }
             ':' => Token::Colon,
             '=' => {
-                if self.starts_with("=") { self.bump(); Token::EqEq } else { Token::Eq }
+                if self.starts_with("=") {
+                    self.bump();
+                    Token::EqEq
+                } else {
+                    Token::Eq
+                }
             }
             '<' => {
-                if self.starts_with("=") { self.bump(); Token::Le } else { Token::Lt }
+                if self.starts_with("=") {
+                    self.bump();
+                    Token::Le
+                } else {
+                    Token::Lt
+                }
             }
             '>' => {
-                if self.starts_with("=") { self.bump(); Token::Ge } else { Token::Gt }
+                if self.starts_with("=") {
+                    self.bump();
+                    Token::Ge
+                } else {
+                    Token::Gt
+                }
             }
             '+' => Token::Plus,
             '-' => Token::Minus,

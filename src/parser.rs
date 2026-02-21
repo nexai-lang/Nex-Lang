@@ -165,33 +165,46 @@ impl<'a> Parser<'a> {
     }
 
     // cap fs.read("..."); | cap net.listen(8080);
-    fn parse_cap_decl(&mut self) -> PResult<CapabilityDecl> {
-        self.expect(Token::Cap)?;
+  fn parse_cap_decl(&mut self) -> PResult<CapabilityDecl> {
+    self.expect(Token::Cap)?;
 
-        let (a, _) = self.expect_ident()?;
-        self.expect(Token::Dot)?;
-        let (b, _) = self.expect_ident()?;
-        self.expect(Token::LParen)?;
+    let (a, _) = self.expect_ident()?;
+    self.expect(Token::Dot)?;
+    let (b, _) = self.expect_ident()?;
+    self.expect(Token::LParen)?;
 
-        let cap = match (a.as_str(), b.as_str()) {
-            ("fs", "read") => {
-                let (glob, _) = self.expect_string()?;
-                self.expect(Token::RParen)?;
-                self.expect(Token::Semi)?;
-                Capability::FsRead { glob }
-            }
-            ("net", "listen") => {
-                let (port, _) = self.expect_int()?;
-                self.expect(Token::RParen)?;
-                self.expect(Token::Semi)?;
-                Capability::NetListen { port }
-            }
-            _ => return self.err_here("Unknown capability. Expected fs.read(...) or net.listen(...)."),
-        };
+    let cap = match (a.as_str(), b.as_str()) {
+        ("fs", "read") => {
+            let (glob, _) = self.expect_string()?;
+            self.expect(Token::RParen)?;
+            self.expect(Token::Semi)?;
+            Capability::FsRead { glob }
+        }
+        ("net", "listen") => {
+            let (start, _) = self.expect_int()?;
 
-        Ok(CapabilityDecl { cap })
-    }
+            // Check if it's a range: 8000..9000
+            let range = if self.consume(Token::Dot).is_some() {
+                self.expect(Token::Dot)?; // second dot
 
+                let (end, _) = self.expect_int()?;
+                NetPortSpec::Range(start, end)
+            } else {
+                NetPortSpec::Single(start)
+            };
+
+            self.expect(Token::RParen)?;
+            self.expect(Token::Semi)?;
+
+            Capability::NetListen { range }
+        }
+        _ => return self.err_here(
+            "Unknown capability. Expected fs.read(...) or net.listen(...).",
+        ),
+    };
+
+    Ok(CapabilityDecl { cap })
+}
     // neural name(params): type { format "..."; path "..."; }
     fn parse_neural_decl(&mut self) -> PResult<NeuralDecl> {
         self.expect(Token::Neural)?;

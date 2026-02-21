@@ -1,0 +1,7 @@
+cap net.listen(8000..9000);
+
+fn main() !io !net {
+  let base = 8000;
+  let p = base + 85;
+  listen_http(p);
+}

@@ -1,17 +1,14 @@
-# Rust
+# Rust build output
 /target/
-**/*.rs.bk
-Cargo.lock
 
-# OS/editor
-.DS_Store
-Thumbs.db
-.vscode/
-.idea/
+# Generated output crate (if it lives outside target, ignore it too)
+/nex_out/
+/target/nex_out/
 
-# Logs / temp
-*.log
-*.tmp
+# Debug dumps / scratch
+*_dump*.txt
+*.txt
 
-# NEX generated output (optional: keep it out of git)
-target/nex_out/
+# Local sandbox runtime files
+/sandbox_data/
+/sandbox_data/logs/

@@ -1,0 +1,11 @@
+cap net.listen(8000..9000);
+
+fn get_port() : i32 {
+  return 8085;
+}
+
+fn main() !io !net {
+  let p = get_port();
+  net.listen(p);
+  print("ok");
+}

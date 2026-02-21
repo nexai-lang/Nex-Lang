@@ -1,0 +1,5 @@
+cap net.listen(8000..9000);
+
+fn main() !io !net {
+  net.listen(7000);
+}

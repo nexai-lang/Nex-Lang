@@ -1,0 +1,6 @@
+cap fs.read("logs/*.txt");
+
+fn main() !io {
+  let x = read_file("../secret.txt");
+  print(x);
+}

@@ -1,0 +1,6 @@
+cap net.listen(8085);
+
+fn main() !io !net {
+  let p = 8085;
+  listen_http(p);
+}

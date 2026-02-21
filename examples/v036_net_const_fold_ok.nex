@@ -1,0 +1,7 @@
+cap net.listen(8000..9000);
+
+fn main() !io !net {
+  let p = 8000 + 85;
+  net.listen(p);
+  print("ok");
+}

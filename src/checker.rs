@@ -237,25 +237,117 @@ fn builtin_sig(name: &str) -> Option<BuiltinSig> {
 
 // -------------------- Capability checks --------------------
 
+
+fn __nex_normalize_rel_path_keep_glob(input: &str) -> Option<String> {
+    // Allows relative paths + glob chars (*, ?) but blocks traversal/absolute/drive.
+    let mut x = input.trim().replace('\\', "/");
+
+    while x.starts_with("./") {
+        x = x[2..].to_string();
+    }
+
+    if x.starts_with('/') {
+        return None;
+    }
+    if x.contains(':') {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in x.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return None;
+        }
+        parts.push(seg);
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(parts.join("/"))
+}
+
+fn __nex_glob_match(pat: &str, text: &str) -> bool {
+    // '*' = any sequence, '?' = any single char
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut star_i: Option<usize> = None;
+    let mut star_j: usize = 0;
+
+    let pb = pat.as_bytes();
+    let tb = text.as_bytes();
+
+    while j < tb.len() {
+        if i < pb.len() && (pb[i] == tb[j] || pb[i] == b'?') {
+            i += 1;
+            j += 1;
+        } else if i < pb.len() && pb[i] == b'*' {
+            star_i = Some(i);
+            star_j = j;
+            i += 1;
+        } else if let Some(si) = star_i {
+            i = si + 1;
+            star_j += 1;
+            j = star_j;
+        } else {
+            return false;
+        }
+    }
+
+    while i < pb.len() && pb[i] == b'*' {
+        i += 1;
+    }
+    i == pb.len()
+}
+
+
+
 fn capability_sort_key(c: &Capability) -> String {
     match c {
         Capability::FsRead { glob } => format!("fs.read({})", glob),
-        Capability::NetListen { port } => format!("net.listen({})", port),
+        Capability::NetListen { range } => format!("net.listen({})", net_port_spec_to_string(range)),
     }
 }
 
 fn require_fs_read_capability(declared_caps: &[Capability], path: &str) -> Result<(), CheckError> {
+    let norm_path = match __nex_normalize_rel_path_keep_glob(path) {
+        Some(p) => p,
+        None => {
+            return Err(CheckError {
+                message: format!("❌ fs.read blocked: unsafe path `{}`.", path),
+                hint: Some("Use a safe relative path like `logs/a.txt` (no `..`, no absolute paths).".to_string()),
+                cause: Some("path normalization rejected the input".to_string()),
+                span: None,
+                note_span: None,
+                note: None,
+            })
+        }
+    };
+
     for c in declared_caps {
         if let Capability::FsRead { glob } = c {
-            // very simple glob: "*" matches all, otherwise exact match
-            if glob == "*" || glob == path {
+            // Special case: allow all
+            if glob.trim() == "*" {
+                return Ok(());
+            }
+
+            let norm_glob = match __nex_normalize_rel_path_keep_glob(glob) {
+                Some(g) => g,
+                None => continue, // ignore unsafe globs
+            };
+
+            if __nex_glob_match(&norm_glob, &norm_path) {
                 return Ok(());
             }
         }
     }
+
     Err(CheckError {
-        message: format!("❌ Capability missing: need `cap fs.read(\"{}\")` (or `\"*\"`).", path),
-        hint: Some("Add: cap fs.read(\"*\"); (or a tighter glob)".to_string()),
+        message: format!("❌ Capability missing: need `cap fs.read(\"{}\")` (or a matching glob).", path),
+        hint: Some("Example: cap fs.read(\"logs/*.txt\"); or cap fs.read(\"*\");".to_string()),
         cause: Some("missing capability".to_string()),
         span: None,
         note_span: None,
@@ -263,22 +355,39 @@ fn require_fs_read_capability(declared_caps: &[Capability], path: &str) -> Resul
     })
 }
 
+
 fn require_net_listen_capability(declared_caps: &[Capability], port: i64) -> Result<(), CheckError> {
     for c in declared_caps {
-        if let Capability::NetListen { port: p } = c {
-            if *p == port {
+        if let Capability::NetListen { range } = c {
+            if net_port_spec_allows(range, port) {
                 return Ok(());
             }
         }
     }
     Err(CheckError {
-        message: format!("❌ Capability missing: need `cap net.listen({})`.", port),
-        hint: Some(format!("Add: cap net.listen({});", port)),
+        message: format!("❌ Capability missing: no `cap net.listen(...)` allows port {}.", port),
+        hint: Some("Example: cap net.listen(8080); or cap net.listen(8000..9000);".to_string()),
         cause: Some("missing capability".to_string()),
         span: None,
         note_span: None,
         note: None,
     })
+}
+
+
+
+fn net_port_spec_to_string(r: &NetPortSpec) -> String {
+    match r {
+        NetPortSpec::Single(p) => format!("{}", p),
+        NetPortSpec::Range(a, b) => format!("{}..{}", a, b),
+    }
+}
+
+fn net_port_spec_allows(r: &NetPortSpec, port: i64) -> bool {
+    match r {
+        NetPortSpec::Single(p) => *p == port,
+        NetPortSpec::Range(a, b) => port >= *a && port <= *b,
+    }
 }
 
 // -------------------- Error rendering --------------------

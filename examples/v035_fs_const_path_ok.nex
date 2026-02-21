@@ -1,0 +1,7 @@
+cap fs.read("logs/*.txt");
+
+fn main() !io {
+  let path = "logs/a.txt";
+  let x = fs.read(path);
+  print(x);
+}

@@ -45,9 +45,6 @@ pub enum Stmt {
         value: Expr,
     },
 
-    // v0.2.0: allow `return;` for void functions
-    // - Return(None) => `return;`
-    // - Return(Some(expr)) => `return expr;`
     Return(Option<Expr>),
 
     Expr(Expr),
@@ -132,7 +129,13 @@ pub struct CapabilityDecl {
 #[derive(Debug, Clone)]
 pub enum Capability {
     FsRead { glob: String },
-    NetListen { port: i64 },
+    NetListen { range: NetPortSpec },
+}
+
+#[derive(Debug, Clone)]
+pub enum NetPortSpec {
+    Single(i64),
+    Range(i64, i64),
 }
 
 #[derive(Debug, Clone)]
