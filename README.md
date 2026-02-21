@@ -1,105 +1,151 @@
-# NEX
+NEX
 
-> A deterministic, capability-safe, effect-typed systems language  
-> designed as a secure execution substrate for autonomous agents.
+A deterministic, capability-safe, effect-typed systems language.
 
----
+Built from scratch as a secure execution substrate for autonomous agents.
 
-## Problem
+This is not a toy DSL.
+This is an experiment in building a language that refuses to execute unsafe behavior silently.
 
-Modern AI systems increasingly execute:
-
-- Dynamically generated code
-- Untrusted tools
-- File system operations
-- Network operations
-- Concurrent tasks
-
-Most general-purpose languages provide:
-
-- Unrestricted filesystem access
-- Unrestricted networking
-- No enforced effect boundaries
-- Ad-hoc async cancellation
-- No deterministic task structure
-
-This creates security, correctness, and isolation risks.
+Current version: v0.3.9
 
 ---
 
-## Design Goals
+## Why This Exists
 
-NEX is designed to provide:
+Modern AI systems increasingly execute generated code.
 
-1. Compile-time capability enforcement
-2. Explicit effect declarations
-3. Deterministic structured concurrency
-4. Runtime enforcement mirroring compile-time policy
-5. Memory-safe execution via Rust backend
+That code:
+- Reads files
+- Opens sockets
+- Spawns tasks
+- Talks to networks
 
-NEX is not a scripting language.
+Most languages allow this implicitly.
 
-It is a policy-enforced execution substrate.
+NEX does not.
+
+In NEX:
+- Every side effect must be declared.
+- Every capability must be granted.
+- Every task must be accounted for.
+
+No silent escalation.
+No hidden IO.
+No orphan tasks.
+
+If the compiler cannot prove it is safe, it refuses to compile.
 
 ---
 
 ## Core Principles
 
-- No implicit side effects
-- No detached async execution
-- All I/O must be declared
-- All async must be declared
-- Capabilities must be explicitly granted
-- Parent-child task trees are enforced
-- Cancellation propagates deterministically
+1. Determinism over convenience
+2. Explicit effects over hidden behavior
+3. Capabilities over ambient authority
+4. Compile-time guarantees over runtime hope
 
 ---
 
 ## Example
 
 ```nex
-cap fs.read("config.txt");
+cap fs.read("logs/*.txt");
 
-fn worker() !async {
-    spawn {
-        if cancelled() {
-            return;
-        }
-    };
-}
-
-fn main() !async {
-    let t = spawn { worker(); };
-    cancel(t);
-    join(t);
+fn main() !io {
+  let content = read_file("logs/a.txt");
+  print(content);
 }
 ```
 
----
+If you attempt:
 
-## Structured Concurrency (v0.2.0)
+```nex
+read_file("../secret.txt");
+```
 
-- Every `spawn` is attached to a parent task
-- Cancellation propagates to descendants
-- `join` waits for entire subtree
-- Parent exit triggers deterministic child cleanup
-- No orphaned tasks possible
+Compilation fails.
 
----
-
-## Compilation Pipeline
-
-Lexer → Parser → AST → Checker → Rust Codegen
+The language does not trust you.
+And it definitely does not trust generated code.
 
 ---
 
-## Roadmap
+## Network Capability
 
-- v0.2.0 — Structured concurrency (complete)
-- v0.3.0 — Capability patterns
-- v0.4.0 — Runtime limits
-- v0.5.0 — Module system
-- v1.0.0 — Stable execution kernel for autonomous systems
+Static port enforcement:
 
+```nex
+cap net.listen(8000..9000);
 
+fn main() !net {
+  let p = 8085;
+  listen_http(p);
+}
+```
 
+Non-constant ports are rejected.
+Dynamic escalation is rejected.
+
+The compiler must be able to prove the port at compile time.
+
+---
+
+## Effect System
+
+Functions must declare effects explicitly:
+
+```
+fn main() !io !net !async {
+    ...
+}
+```
+
+If you forget, compilation fails.
+
+Effects are part of the function boundary.
+Not an afterthought.
+
+---
+
+## Structured Concurrency
+
+Tasks form a tree.
+
+- No detached threads
+- No forgotten handles
+- No silent background execution
+
+When the root exits, everything exits.
+
+---
+
+## What v0.3.9 Includes
+
+- File capability glob matching
+- Path traversal blocking
+- Network port ranges
+- Compile-time constant port verification
+- Range + single port enforcement
+- Deterministic effect validation
+- Structured error rendering with spans
+
+This version stabilizes the capability system.
+
+---
+
+## Status
+
+This is an active research project.
+
+It is being built incrementally toward:
+
+v0.4.x → runtime governance
+v0.5.x → modules
+v1.0.0 → secure execution layer for NEXUS OS
+
+---
+
+## License
+
+Apache-2.0
