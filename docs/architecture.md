@@ -10,11 +10,6 @@ The compiler follows a strict multi-stage pipeline. Each stage has a single resp
 
 ```mermaid
 flowchart TD
-...
-
-
-Delete that entire block.
-
 ---
 
 # ✅ STEP 3 — Paste This Safe Version
