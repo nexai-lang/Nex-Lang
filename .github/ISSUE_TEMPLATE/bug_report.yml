@@ -1,0 +1,74 @@
+name: "🐛 Bug report"
+description: Report a reproducible bug in the NEX compiler/runtime.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. NEX is security- and determinism-first, so minimal repros are critical.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+      placeholder: "When running `nex check ...`, I expected ..., but got ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Provide the smallest `.nex` program that reproduces the bug.
+      render: text
+      placeholder: |
+        cap fs.read("logs/*.txt");
+
+        fn main() !io {
+          let x = fs.read("logs/a.txt");
+          print(x);
+        }
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command used
+      render: bash
+      placeholder: "cargo run -- check examples/foo.nex"
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Output / Error
+      render: text
+      placeholder: Paste the full error message / backtrace (if any)
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: NEX version / tag
+      placeholder: "v0.3.9"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "Ubuntu 24.04 / Windows 11 / macOS"
+    validations:
+      required: true
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else that might help (recent changes, related issues, etc.)
