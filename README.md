@@ -208,3 +208,8 @@ The compiler guarantees that generated programs cannot exceed declared authority
 - [RFC Process](docs/rfcs/0000-template.md)
 
 ---
+
+![Version](https://img.shields.io/badge/version-0.3.9-blue)
+![License](https://img.shields.io/badge/license-Apache%202.0-green)
+![Status](https://img.shields.io/badge/status-experimental-orange)
+
