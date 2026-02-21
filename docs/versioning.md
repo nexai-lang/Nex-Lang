@@ -1,32 +1,59 @@
-# NEX Versioning Strategy
+# Versioning Policy
 
-NEX uses semantic versioning with an explicit rule:
-**minor versions may add features; patch versions may only fix bugs.**
+NEX follows Semantic Versioning.
 
-Example: `v0.3.9`
+Format:
 
-> While NEX is < 1.0, breaking changes may occur, but we still document them as if we were post-1.0.
+MAJOR.MINOR.PATCH
 
-## Version Meaning
-- **MAJOR**: Reserved for v1.0 when core language semantics stabilize.
-- **MINOR**: Feature milestones (language semantics, checker rules, runtime invariants).
-- **PATCH**: Bug fixes, diagnostics, docs, tests, performance improvements that do not change semantics.
+Example:
+0.3.9
 
-## Release Requirements
-A release tag must include:
-- Release notes summarizing changes
-- Tests passing in CI
-- Any breaking change clearly highlighted
+---
 
-## Tagging
-- Tags use `vX.Y.Z` format (e.g., `v0.3.9`)
-- `main` is always ahead of the last tag
-- Work-in-progress features should land behind tests/examples and be documented
+## MAJOR
 
-## Compatibility Notes
-Each MINOR release should state:
-- Syntax additions/changes
-- Checker rule changes
-- Runtime enforcement changes
-- Migration hints for existing `.nex` examples
+Incremented when:
+- Breaking language syntax changes
+- AST structure changes
+- Compiler behavior changes that invalidate existing programs
 
+---
+
+## MINOR
+
+Incremented when:
+- New language features are added
+- New capabilities are introduced
+- Structured concurrency enhancements
+- Backwards-compatible compiler improvements
+
+---
+
+## PATCH
+
+Incremented when:
+- Bug fixes
+- Diagnostic improvements
+- Performance improvements
+- Internal refactors with no language impact
+
+---
+
+## Pre-1.0 Policy
+
+Until v1.0.0:
+
+Minor versions MAY contain breaking changes.
+
+After v1.0.0:
+
+Breaking changes require MAJOR version increment.
+
+---
+
+## Stability Targets
+
+- v0.x → Experimental but structured
+- v1.0.0 → Stable core language
+- v1.x → Production compiler evolution
