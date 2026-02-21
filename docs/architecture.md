@@ -11,9 +11,6 @@ The compiler follows a strict multi-stage pipeline. Each stage has a single resp
 ```mermaid
 flowchart TD
 ---
-
-# ✅ STEP 3 — Paste This Safe Version
-
 ````markdown
 ```mermaid
 flowchart TD
