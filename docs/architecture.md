@@ -9,6 +9,8 @@ The compiler follows a strict multi-stage pipeline. Each stage has a single resp
 ## Compilation Pipeline
 
 ---
+````markdown
+```mermaid
 flowchart TD
 
     A["Source File .nex"]
