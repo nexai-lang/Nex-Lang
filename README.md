@@ -100,7 +100,8 @@ fn main !io {
     let content = read_file("examples/demo.nex");
     print(content);
 }
-Running
+
+##Running
 cargo build
 ./target/debug/nex check examples/demo.nex
 ./target/debug/nex run examples/demo.nex
@@ -114,7 +115,8 @@ To control resource budgets:
 NEX_FUEL_BUDGET=1000
 NEX_MEM_BUDGET=1024
 NEX_AUDIT_PATH=audit.jsonl
-What NEX Is Not
+
+##What NEX Is Not
 
 Not a general-purpose language
 
@@ -126,7 +128,7 @@ Not a toy DSL
 
 NEX is a controlled execution layer for autonomous workloads.
 
-Roadmap
+##Roadmap
 v0.5.x – Observability & Replay
 
 Run envelope events
