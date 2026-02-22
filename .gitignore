@@ -1,14 +1,26 @@
-# Rust build output
-/target/
+# ===============================
+# Rust Build Artifacts
+# ===============================
+target/
+**/target/
 
-# Generated output crate (if it lives outside target, ignore it too)
-/nex_out/
-/target/nex_out/
+# ===============================
+# NEX Generated Output
+# ===============================
+nex_out*/
+sandbox_data/
+sandbox_data2/
+logs/
 
-# Debug dumps / scratch
-*_dump*.txt
-*.txt
+# ===============================
+# Backup / Temporary Files
+# ===============================
+*.bak
+*.BACKUP
+*BROKEN*
+*.tmp
 
-# Local sandbox runtime files
-/sandbox_data/
-/sandbox_data/logs/
+# ===============================
+# Runtime Logs
+# ===============================
+*.jsonl
