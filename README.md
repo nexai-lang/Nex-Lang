@@ -234,30 +234,6 @@ Apache-2.0
 
 NEX follows a deterministic, multi-stage compilation pipeline.
 
-```mermaid
-flowchart TD
-
-    A[.nex Source File]
-    B[Lexer]
-    C[Parser]
-    D[AST Construction]
-    E[Semantic Checker]
-    F[Capability Validation]
-    G[Effect Enforcement]
-    H[Code Generation - Rust Backend]
-    I[Rust Compilation]
-    J[Executable Binary]
-
-    A --> B
-    B --> C
-    C --> D
-    D --> E
-    E --> F
-    F --> G
-    G --> H
-    H --> I
-    I --> J
-```
 
 ---
 
