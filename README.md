@@ -102,18 +102,11 @@ This version includes:
 
 NEX follows a deterministic compilation pipeline:
 
-```mermaid
-flowchart TD
-    A[.nex Source File] --> B[Lexer]
-    B --> C[Parser]
-    C --> D[AST Construction]
-    D --> E[Semantic Checker]
-    E --> F[Capability Validation]
-    F --> G[Effect Enforcement]
-    G --> H[Rust Code Generation]
-    H --> I[Rust Compilation]
-    I --> J[Governed Executable]
-```
+## Compiler Architecture
+
+NEX follows a deterministic, multi-stage compilation pipeline:
+
+![NEX Compilation Pipeline](docs/assets/architecture.gif)
 
 ---
 
