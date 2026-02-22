@@ -101,7 +101,7 @@ fn main !io {
     print(content);
 }
 
-##Running
+## Running
 cargo build
 ./target/debug/nex check examples/demo.nex
 ./target/debug/nex run examples/demo.nex
@@ -128,7 +128,7 @@ Not a toy DSL
 
 NEX is a controlled execution layer for autonomous workloads.
 
-##Roadmap
+## Roadmap
 v0.5.x – Observability & Replay
 
 Run envelope events
