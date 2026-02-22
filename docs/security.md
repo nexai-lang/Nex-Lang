@@ -1,154 +1,103 @@
-# NEX Security Model
+# Security Policy
 
-NEX is designed as a capability-safe execution substrate for autonomous systems.
+NEX is a governed execution language and runtime designed to constrain authority by construction. Security is a core product requirement, not an optional feature.
 
-Security is not a runtime feature.
-It is a compile-time invariant.
-
----
-
-## Threat Model
-
-NEX assumes:
-
-- Code may be generated dynamically
-- Code may be adversarial
-- Code may attempt privilege escalation
-- Code may attempt filesystem or network traversal
-- Code may attempt detached concurrency
-
-NEX enforces strict guarantees to eliminate these classes of risks.
+This document describes how to report vulnerabilities and what security expectations users should have at the current stage of the project.
 
 ---
 
-# 1. Capability-Based Authority
+## Supported Versions
 
-NEX uses an explicit authority model.
+NEX is currently **experimental**. Security fixes will be released on the latest active version line.
 
-No resource can be accessed unless declared.
-
-Example:
-
-```
-cap fs.read("logs/*.txt");
-cap net.listen(8000..9000);
-```
-
-If code attempts:
-
-- Reading undeclared files
-- Accessing out-of-range ports
-- Traversing outside declared glob patterns
-
-Compilation fails.
-
-There is no runtime fallback.
+| Version | Supported |
+|--------:|:---------:|
+| v0.4.x  | ✅ Yes |
+| v0.3.x  | ⚠️ Best-effort |
+| < v0.3  | ❌ No |
 
 ---
 
-# 2. No Implicit Authority
+## Security Model (High Level)
 
-NEX does not allow:
+NEX aims to provide the following guarantees:
 
-- Dynamic capability construction
-- Authority inference
-- Implicit privilege inheritance
-- Global ambient authority
+- **Deny-by-default capabilities**: filesystem/network operations require explicit capability declarations.
+- **Effect transparency**: `!io` and `!async` must be declared at function boundaries; transitive effects are checked.
+- **Structured concurrency**: task trees are enforced; cancellation is deterministic; no orphan tasks at process exit.
+- **Resource governance**: cooperative fuel checkpoints and memory ceilings provide bounded execution.
+- **Audit telemetry**: runtime emits machine-readable JSONL events for security-relevant actions.
 
-All authority must be statically declared at the top level.
-
----
-
-# 3. Effect System Enforcement
-
-Functions must explicitly declare side effects.
-
-Supported effects:
-
-- `!io`
-- `!async`
-
-This prevents:
-
-- Hidden I/O
-- Silent mutation
-- Undeclared asynchronous execution
-
-Pure functions are statically enforced.
+NEX is not a general sandbox and does not attempt to defend against all OS-level side channels. Its purpose is to provide a reliable, deterministic control layer for autonomous execution.
 
 ---
 
-# 4. Structured Concurrency Guarantees
+## Reporting a Vulnerability
 
-NEX enforces deterministic task trees.
+If you believe you have found a security vulnerability, please report it responsibly.
 
-Security properties:
+### Preferred reporting method
 
-- No detached tasks
-- Parent-child task registry
-- Subtree cancellation propagation
-- No orphan background execution
-- Root task cleanup at exit
+1. Open a **GitHub Issue** titled:  
+   **`[SECURITY] <short description>`**
+2. Include:
+   - NEX version (`./target/debug/nex --version` if available, or tag/commit hash)
+   - Platform (Linux/Windows/macOS)
+   - Minimal reproduction (`.nex` program if possible)
+   - Expected vs actual behavior
+   - Any logs (including `nex_audit.jsonl` output if relevant)
 
-This prevents:
+### If you need private disclosure
 
-- Zombie background threads
-- Resource leaks
-- Hidden asynchronous escalation
+If you are uncomfortable filing a public issue:
+- Create a draft issue with minimal detail and request private coordination.
 
----
-
-# 5. Compile-Time Policy Mirror
-
-Every runtime policy mirrors a static rule.
-
-If a program compiles:
-
-- It cannot exceed its declared authority
-- It cannot escalate privileges
-- It cannot spawn unmanaged tasks
-
-Runtime checks exist only to mirror compile-time guarantees.
+(As the project matures, a dedicated security contact and formal CVE handling may be added.)
 
 ---
 
-# 6. Filesystem Safety
+## What Counts as a Security Issue
 
-NEX enforces:
+We consider the following in-scope:
 
-- Glob-based file access
-- Path normalization
-- Traversal blocking (`../` protection)
-- Literal or const-folded path enforcement
+- Capability bypass (e.g., path traversal, glob bypass, normalization failures)
+- Effect enforcement bypass (`!io`, `!async` not required when it should be)
+- Escaping structured concurrency invariants (orphan tasks, cancel/join bypass)
+- Resource governance bypass (fuel/memory limits not enforced as specified)
+- Audit log integrity issues (missing or incorrect security-relevant events)
+- Crashes or panics that can be triggered by untrusted input (compiler or runtime)
 
-Dynamic path computation is rejected.
+Out of scope (for now):
 
----
-
-# 7. Network Safety
-
-NEX enforces:
-
-- Literal or const-folded port values
-- Range-based declarations
-- No runtime port mutation
-
-Example:
-
-```
-cap net.listen(8000..9000);
-```
-
-Listening on 7000 would fail compilation.
+- OS kernel vulnerabilities
+- Hardware side channels
+- Attacks requiring local administrator privileges
 
 ---
 
-# Security Philosophy
+## Security Response Process
 
-Security is not an optional feature.
+When a report is accepted:
 
-It is a property of the type system.
+1. **Triage** within a reasonable timeframe
+2. **Reproduce** and classify severity
+3. **Patch** with regression tests (golden tests preferred)
+4. **Release** a tagged version with clear changelog notes
 
-NEX assumes that autonomous systems must operate under strict authority boundaries.
+---
 
-The compiler is the first line of defense.
+## Hardening Roadmap
+
+Planned improvements include:
+
+- Stable IR layers (HIR/MIR) with stronger validation boundaries
+- Deterministic replay tooling for incident analysis
+- Stronger memory accounting and per-task hard ceilings
+- Expanded audit schema and event sequencing guarantees
+- Tool ecosystem governance (safe web/search adapters)
+
+---
+
+## Acknowledgements
+
+Security contributions are welcome. If you submit a report or patch, you may be credited in the changelog/release notes (at your preference).
