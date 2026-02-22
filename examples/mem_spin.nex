@@ -1,0 +1,6 @@
+fn main() {
+  loop {
+    // 64 bytes per iteration (charged when literal -> String is constructed)
+    let x = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  }
+}

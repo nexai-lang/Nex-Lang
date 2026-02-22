@@ -13,14 +13,12 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
 //
 // v0.2.x: Structured Concurrency (task trees, cancel/join)
 // v0.3.x: Capability policies (fs.read globs + net.listen ranges)
-// v0.4.0: Resource Governance (fuel + audit + deterministic task termination)
-// v0.4.1: Memory scaffolding (soft accounting + MemoryExceeded)
+// v0.4.0: Resource Governance Phase 1 (fuel contract + JSONL audit + join_subtree)
 "#);
 
     // ------------------------------
     // Imports
     // ------------------------------
-    w.l("use std::any::Any;");
     w.l("use std::cell::RefCell;");
     w.l("use std::collections::{HashMap, VecDeque};");
     w.l("use std::fs;");
@@ -30,7 +28,7 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("");
 
     // ------------------------------
-    // Capability allowlists
+    // Capability allowlists (defense-in-depth)
     // ------------------------------
     let (fs_globs, net_ports, net_port_ranges) = collect_cap_allowlists(program);
 
@@ -62,10 +60,11 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("");
 
     // ------------------------------
-    // v0.3.x helpers: path normalization + glob matching
+    // v0.3.x helpers: path normalization + glob matching + allow checks
     // ------------------------------
     w.l("fn __nex_normalize_rel_path(input: &str) -> Option<String> {");
     w.ind += 1;
+    w.l("// Normalize relative paths, deny traversal and absolute/drive paths.");
     w.l("let mut x = input.trim().replace('\\\\', \"/\");");
     w.l("while x.starts_with(\"./\") { x = x[2..].to_string(); }");
     w.l("if x.starts_with('/') { return None; }");
@@ -84,6 +83,7 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("}");
     w.l("");
 
+    // Glob matcher supporting '*' and '?'.
     w.l("fn __nex_glob_match(pat: &str, text: &str) -> bool {");
     w.ind += 1;
     w.l("let (mut i, mut j) = (0usize, 0usize);");
@@ -93,10 +93,27 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("let tb = text.as_bytes();");
     w.l("while j < tb.len() {");
     w.ind += 1;
-    w.l("if i < pb.len() && (pb[i] == tb[j] || pb[i] == b'?') { i += 1; j += 1; }");
-    w.l("else if i < pb.len() && pb[i] == b'*' { star_i = Some(i); star_j = j; i += 1; }");
-    w.l("else if let Some(si) = star_i { i = si + 1; star_j += 1; j = star_j; }");
-    w.l("else { return false; }");
+    w.l("if i < pb.len() && (pb[i] == tb[j] || pb[i] == b'?') {");
+    w.ind += 1;
+    w.l("i += 1; j += 1;");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("} else if i < pb.len() && pb[i] == b'*' {");
+    w.ind += 1;
+    w.l("star_i = Some(i);");
+    w.l("star_j = j;");
+    w.l("i += 1;");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("} else if let Some(si) = star_i {");
+    w.ind += 1;
+    w.l("i = si + 1;");
+    w.l("star_j += 1;");
+    w.l("j = star_j;");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("} else {");
+    w.ind += 1;
+    w.l("return false;");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("while i < pb.len() && pb[i] == b'*' { i += 1; }");
@@ -105,15 +122,26 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("}");
     w.l("");
 
+    // FS allow check (define exactly once)
     w.l("fn __nex_fs_read_allowed(raw_path: &str) -> bool {");
     w.ind += 1;
-    w.l("let norm_path = match __nex_normalize_rel_path(raw_path) { Some(p) => p, None => return false };");
+    w.l("let norm_path = match __nex_normalize_rel_path(raw_path) {");
+    w.ind += 1;
+    w.l("Some(p) => p,");
+    w.l("None => return false,");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("};");
     w.l("if __NEX_FS_READ_ALLOW.iter().any(|g| *g == \"*\") { return true; }");
     w.l("for g in __NEX_FS_READ_ALLOW.iter() {");
     w.ind += 1;
     w.l("let gg = g.trim();");
     w.l("if gg == \"*\" { return true; }");
-    w.l("let norm_glob = match __nex_normalize_rel_path(gg) { Some(x) => x, None => continue };");
+    w.l("let norm_glob = match __nex_normalize_rel_path(gg) {");
+    w.ind += 1;
+    w.l("Some(x) => x,");
+    w.l("None => continue,");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("};");
     w.l("if __nex_glob_match(&norm_glob, &norm_path) { return true; }");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
@@ -122,6 +150,7 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("}");
     w.l("");
 
+    // net.listen allowed if in single list OR any range
     w.l("fn __nex_net_listen_allowed(port: i64) -> bool {");
     w.ind += 1;
     w.l("let single_ok = __NEX_NET_LISTEN_ALLOW.iter().any(|p| *p == port);");
@@ -134,30 +163,14 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("");
 
     // ------------------------------
-    // v0.4: JSONL audit
-    // ------------------------------
-    // ------------------------------
-    // v0.4: JSONL audit (configurable path)
+    // v0.4.0: JSONL audit (Phase 1)
     // ------------------------------
     w.l("static __NEX_AUDIT: OnceLock<Mutex<BufWriter<std::fs::File>>> = OnceLock::new();");
-    w.l("fn __nex_audit_path() -> String {");
-    w.ind += 1;
-    w.l("if let Ok(p) = std::env::var(\"NEX_AUDIT_PATH\") {");
-    w.ind += 1;
-    w.l("if !p.trim().is_empty() { return p; }");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("\"nex_audit.jsonl\".to_string()");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
     w.l("fn __nex_audit() -> &'static Mutex<BufWriter<std::fs::File>> {");
     w.ind += 1;
     w.l("__NEX_AUDIT.get_or_init(|| {");
     w.ind += 1;
-    w.l("let path = __nex_audit_path();");
-    w.l("let f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();");
+    w.l("let f = std::fs::OpenOptions::new().create(true).append(true).open(\"nex_audit.jsonl\").unwrap();");
     w.l("Mutex::new(BufWriter::new(f))");
     w.ind = w.ind.saturating_sub(1);
     w.l("})");
@@ -165,12 +178,22 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("}");
     w.l("");
 
-    w.l("fn __nex_json_escape(s: &str) -> String { s.replace('\\\\', \"\\\\\\\\\").replace('\"', \"\\\\\\\"\") }");
+    w.l("fn __nex_json_escape(s: &str) -> String {");
+    w.ind += 1;
+    w.l("s.replace('\\\\', \"\\\\\\\\\").replace('\"', \"\\\\\\\"\")");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
     w.l("");
 
     w.l("fn __nex_audit_line(line: &str) {");
     w.ind += 1;
-    w.l("if let Ok(mut w) = __nex_audit().lock() { let _ = w.write_all(line.as_bytes()); let _ = w.write_all(b\"\\n\"); let _ = w.flush(); }");
+    w.l("if let Ok(mut w) = __nex_audit().lock() {");
+    w.ind += 1;
+    w.l("let _ = w.write_all(line.as_bytes());");
+    w.l("let _ = w.write_all(b\"\\n\");");
+    w.l("let _ = w.flush();");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("");
@@ -204,7 +227,7 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("");
 
     // ------------------------------
-    // Structured concurrency + registry
+    // v0.2 runtime: task ids + registry + cancellation tokens + join handles
     // ------------------------------
     w.l("type __NexTaskId = u64;");
     w.l("");
@@ -233,79 +256,19 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("");
 
     // ------------------------------
-    // v0.4.x TaskContext (fuel + memory)
+    // v0.4.0 Fuel contract (Phase 1)
     // ------------------------------
     w.l("const __NEX_FUEL_API_VERSION: u32 = 1;");
-    w.l("const __NEX_RESOURCE_PANIC_SENTINEL: &str = \"__NEX_RESOURCE_EXHAUSTED__\";");
-
-    w.l("const __NEX_DEFAULT_FUEL_BUDGET: u64 = 50_000;");
-    w.l("const __NEX_FUEL_COST_FN_ENTRY: u64 = 1;");
-    w.l("const __NEX_FUEL_COST_LOOP_TICK: u64 = 1;");
-    w.l("const __NEX_FUEL_COST_CAPABILITY: u64 = 10;");
-
-    // Memory scaffolding: soft accounting only.
-    w.l("const __NEX_DEFAULT_MEM_BUDGET_BYTES: u64 = 64 * 1024 * 1024; // 64MiB default");
-    w.l("const __NEX_MEM_COST_CAPABILITY_OVERHEAD: u64 = 256; // small fixed overhead");
-    w.l("");
-
-    w.l("#[derive(Clone, Debug)]");
-    w.l("struct __NexTaskContext {");
-    w.ind += 1;
-    w.l("task_id: __NexTaskId,");
-    w.l("token: __NexCancelToken,");
-    w.l("fuel_remaining: u64,");
-    w.l("mem_budget_bytes: u64,");
-    w.l("mem_used_bytes: u64,");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
+    w.l("const __NEX_DEFAULT_FUEL_BUDGET: u64 = 1_000_000_000; // large default; injection comes in Phase 2");
     w.l("thread_local! {");
     w.ind += 1;
-    w.l("static __NEX_CTX: RefCell<__NexTaskContext> = RefCell::new(__NexTaskContext {");
-    w.ind += 1;
-    w.l("task_id: 0,");
-    w.l("token: __NexCancelToken::new(),");
-    w.l("fuel_remaining: __NEX_DEFAULT_FUEL_BUDGET,");
-    w.l("mem_budget_bytes: __NEX_DEFAULT_MEM_BUDGET_BYTES,");
-    w.l("mem_used_bytes: 0,");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("});");
+    w.l("static __NEX_CURRENT_TASK_ID: RefCell<__NexTaskId> = RefCell::new(0);");
+    w.l("static __NEX_CURRENT_TOKEN: RefCell<__NexCancelToken> = RefCell::new(__NexCancelToken::new());");
+    w.l("static __NEX_CURRENT_FUEL: RefCell<u64> = RefCell::new(__NEX_DEFAULT_FUEL_BUDGET);");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("");
 
-    w.l("fn __nex_env_u64(name: &str, default: u64) -> u64 {");
-    w.ind += 1;
-    w.l("match std::env::var(name) {");
-    w.ind += 1;
-    w.l("Ok(v) => v.parse::<u64>().unwrap_or(default),");
-    w.l("Err(_) => default,");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
-    w.l("fn __nex_init_context(task_id: __NexTaskId, token: __NexCancelToken) {");
-    w.ind += 1;
-    w.l("let fuel = __nex_env_u64(\"NEX_FUEL_BUDGET\", __NEX_DEFAULT_FUEL_BUDGET);");
-    w.l("let mem = __nex_env_u64(\"NEX_MEM_BUDGET\", __NEX_DEFAULT_MEM_BUDGET_BYTES);");
-    w.l("__NEX_CTX.with(|c| {");
-    w.ind += 1;
-    w.l("*c.borrow_mut() = __NexTaskContext { task_id, token, fuel_remaining: fuel, mem_budget_bytes: mem, mem_used_bytes: 0 };");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("});");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
-    w.l("fn __nex_task_id() -> __NexTaskId { __NEX_CTX.with(|c| c.borrow().task_id) }");
-    w.l("fn __nex_token() -> __NexCancelToken { __NEX_CTX.with(|c| c.borrow().token.clone()) }");
-    w.l("fn cancelled() -> bool { __nex_token().is_cancelled() }");
-    w.l("");
-
-    // Registry
     w.l("fn __nex_registry() -> &'static Mutex<HashMap<__NexTaskId, __NexTaskMeta>> {");
     w.ind += 1;
     w.l("__NEX_TASK_REGISTRY.get_or_init(|| {");
@@ -319,7 +282,19 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("}");
     w.l("");
 
+    w.l("fn __nex_get_current_task_id() -> __NexTaskId { __NEX_CURRENT_TASK_ID.with(|c| *c.borrow()) }");
+    w.l("fn __nex_set_current_task_id(id: __NexTaskId) { __NEX_CURRENT_TASK_ID.with(|c| *c.borrow_mut() = id); }");
+    w.l("fn __nex_get_current_token() -> __NexCancelToken { __NEX_CURRENT_TOKEN.with(|t| t.borrow().clone()) }");
+    w.l("fn __nex_set_current_token(tok: __NexCancelToken) { __NEX_CURRENT_TOKEN.with(|t| *t.borrow_mut() = tok); }");
+    w.l(
+        "fn __nex_set_fuel(budget: u64) { __NEX_CURRENT_FUEL.with(|f| *f.borrow_mut() = budget); }",
+    );
+    w.l("fn __nex_fuel_remaining() -> u64 { __NEX_CURRENT_FUEL.with(|f| *f.borrow()) }");
+    w.l("");
+
     w.l("fn __nex_alloc_task_id() -> __NexTaskId { __NEX_TASK_ID_GEN.fetch_add(1, Ordering::SeqCst) }");
+    w.l("");
+
     w.l("fn __nex_get_token(id: __NexTaskId) -> __NexCancelToken {");
     w.ind += 1;
     w.l("let reg = __nex_registry().lock().unwrap();");
@@ -328,14 +303,19 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("}");
     w.l("");
 
-    // BFS cancellation (non-recursive)
+    // BFS cancel subtree (non-recursive)
     w.l("fn __nex_cancel_subtree(root: __NexTaskId) {");
     w.ind += 1;
     w.l("let mut q: VecDeque<__NexTaskId> = VecDeque::new();");
     w.l("q.push_back(root);");
     w.l("while let Some(id) = q.pop_front() {");
     w.ind += 1;
-    w.l("let children = { let reg = __nex_registry().lock().unwrap(); reg.get(&id).map(|m| m.children.clone()).unwrap_or_default() };");
+    w.l("let children = {");
+    w.ind += 1;
+    w.l("let reg = __nex_registry().lock().unwrap();");
+    w.l("reg.get(&id).map(|m| m.children.clone()).unwrap_or_default()");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("};");
     w.l("for c in children { q.push_back(c); }");
     w.l("__nex_get_token(id).cancel();");
     w.ind = w.ind.saturating_sub(1);
@@ -344,101 +324,36 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.l("}");
     w.l("");
 
-    // Join subtree: snapshot handles then join outside lock
-    w.l("fn __nex_join_subtree(root: __NexTaskId) {");
-    w.ind += 1;
-    w.l("let mut stack: Vec<__NexTaskId> = vec![root];");
-    w.l("let mut order: Vec<__NexTaskId> = Vec::new();");
-    w.l("while let Some(id) = stack.pop() {");
-    w.ind += 1;
-    w.l("order.push(id);");
-    w.l("let children = { let reg = __nex_registry().lock().unwrap(); reg.get(&id).map(|m| m.children.clone()).unwrap_or_default() };");
-    w.l("for c in children { stack.push(c); }");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("order.reverse();");
-    w.l("let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();");
-    w.l("{");
-    w.ind += 1;
-    w.l("let mut reg = __nex_registry().lock().unwrap();");
-    w.l("for id in order { if let Some(m) = reg.get_mut(&id) { if let Some(h) = m.handle.take() { handles.push(h); } } }");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("for h in handles { let _ = h.join(); }");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
-    // Unified terminate mechanism for resource violations
-    w.l("fn __nex_resource_trap(kind: &str, detail: &str) -> ! {");
-    w.ind += 1;
-    w.l("let tid = __nex_task_id();");
-    w.l("__nex_audit_violation(tid, kind, detail);");
-    w.l("__nex_cancel_subtree(tid);");
-    w.l("__nex_token().cancel();");
-    w.l("panic!(\"{}\", __NEX_RESOURCE_PANIC_SENTINEL);");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
-    w.l("fn __nex_is_resource_panic(p: &(dyn Any + Send)) -> bool {");
-    w.ind += 1;
-    w.l(
-        "if let Some(s) = p.downcast_ref::<&str>() { return *s == __NEX_RESOURCE_PANIC_SENTINEL; }",
-    );
-    w.l("if let Some(s) = p.downcast_ref::<String>() { return s.as_str() == __NEX_RESOURCE_PANIC_SENTINEL; }");
-    w.l("false");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
-    // Fuel checkpoint
+    // v0.4.0 Fuel: cooperative checkpoints (Phase 1; injection comes later)
     w.l("fn __nex_consume_fuel(cost: u64) {");
     w.ind += 1;
+    w.l("if __nex_get_current_token().is_cancelled() { return; }");
     w.l("if cost == 0 { return; }");
-    w.l("__NEX_CTX.with(|c| {");
+    w.l("__NEX_CURRENT_FUEL.with(|f| {");
     w.ind += 1;
-    w.l("let mut ctx = c.borrow_mut();");
-    w.l("if ctx.fuel_remaining < cost {");
+    w.l("let mut rem = f.borrow_mut();");
+    w.l("if *rem < cost {");
     w.ind += 1;
-    w.l("let d = format!(\"attempted_cost={}, remaining={}\", cost, ctx.fuel_remaining);");
-    w.l("drop(ctx);");
-    w.l("__nex_resource_trap(\"FuelExhausted\", &d);");
+    w.l("let tid = __nex_get_current_task_id();");
+    w.l("__nex_audit_violation(tid, \"FuelExhausted\", &format!(\"attempted_cost={}, remaining={}\", cost, *rem));");
+    w.l("__nex_cancel_subtree(tid);");
+    w.l("__nex_get_current_token().cancel();");
+    w.l("*rem = 0;");
+    w.l("return;");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
-    w.l("ctx.fuel_remaining -= cost;");
+    w.l("*rem -= cost;");
     w.ind = w.ind.saturating_sub(1);
     w.l("});");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("");
 
-    // Memory charge (soft accounting)
-    w.l("fn __nex_charge_bytes(bytes: u64) {");
+    // Spawn child (structured)
+    w.l("fn __nex_spawn_child<F>(f: F) -> __NexTask");
+    w.l("where F: FnOnce() + Send + 'static {");
     w.ind += 1;
-    w.l("if bytes == 0 { return; }");
-    w.l("__NEX_CTX.with(|c| {");
-    w.ind += 1;
-    w.l("let mut ctx = c.borrow_mut();");
-    w.l("let new_used = ctx.mem_used_bytes.saturating_add(bytes);");
-    w.l("if new_used > ctx.mem_budget_bytes {");
-    w.ind += 1;
-    w.l("let d = format!(\"attempted_add_bytes={}, used_before={}, budget_bytes={}\", bytes, ctx.mem_used_bytes, ctx.mem_budget_bytes);");
-    w.l("drop(ctx);");
-    w.l("__nex_resource_trap(\"MemoryExceeded\", &d);");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("ctx.mem_used_bytes = new_used;");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("});");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
-    w.l("");
-
-    // Spawn child: catch resource sentinel and exit child cleanly.
-    w.l("fn __nex_spawn_child<F>(f: F) -> __NexTask where F: FnOnce() + Send + 'static {");
-    w.ind += 1;
-    w.l("let parent_id = __nex_task_id();");
+    w.l("let parent_id = __nex_get_current_task_id();");
     w.l("let child_id = __nex_alloc_task_id();");
     w.l("let child_tok = __NexCancelToken::new();");
     w.l("{");
@@ -449,88 +364,149 @@ pub fn generate_rust(program: &Program, _async_mode: bool) -> String {
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("__nex_audit_task_spawned(parent_id, child_id);");
-
     w.l("let handle = std::thread::spawn(move || {");
     w.ind += 1;
-    w.l("__nex_init_context(child_id, child_tok.clone());");
-    w.l("let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { f(); }));");
-    w.l("if let Err(p) = res {");
-    w.ind += 1;
-    w.l("if __nex_is_resource_panic(p.as_ref()) { return; }");
-    w.l("panic!(\"NEX runtime: child task panic\");");
-    w.ind = w.ind.saturating_sub(1);
-    w.l("}");
+    w.l("__nex_set_current_task_id(child_id);");
+    w.l("__nex_set_current_token(child_tok.clone());");
+    w.l("__nex_set_fuel(__NEX_DEFAULT_FUEL_BUDGET);");
+    w.l("f();");
     w.ind = w.ind.saturating_sub(1);
     w.l("});");
-
     w.l("{");
     w.ind += 1;
     w.l("let mut reg = __nex_registry().lock().unwrap();");
     w.l("if let Some(m) = reg.get_mut(&child_id) { m.handle = Some(handle); }");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
-
     w.l("__NexTask { id: child_id }");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("");
 
-    // Join helpers
+    // Join a single task by id (moves handle out under lock, joins outside lock)
     w.l("fn __nex_join_task_id(id: __NexTaskId) {");
     w.ind += 1;
-    w.l("let handle_opt = { let mut reg = __nex_registry().lock().unwrap(); reg.get_mut(&id).and_then(|m| m.handle.take()) };");
+    w.l("let handle_opt = {");
+    w.ind += 1;
+    w.l("let mut reg = __nex_registry().lock().unwrap();");
+    w.l("reg.get_mut(&id).and_then(|m| m.handle.take())");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("};");
     w.l("if let Some(h) = handle_opt { let _ = h.join(); }");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("");
 
-    w.l("fn join(t: __NexTask) { __nex_join_task_id(t.id); }");
-    w.l("fn cancel(t: &__NexTask) { __nex_cancel_subtree(t.id); }");
-    w.l("fn sleep_ms(ms: i64) { std::thread::sleep(Duration::from_millis(ms as u64)); }");
-    w.l("");
-
-    // Capability wrappers (fuel + memory + audit)
-    w.l("fn read_file(path: String) -> String {");
+    // Join subtree (correct): snapshot ids, take handles under lock, join outside lock
+    w.l("fn __nex_join_subtree(root: __NexTaskId) {");
     w.ind += 1;
-    w.l("__nex_consume_fuel(__NEX_FUEL_COST_CAPABILITY);");
-    w.l("__nex_charge_bytes(__NEX_MEM_COST_CAPABILITY_OVERHEAD);");
-    w.l("let tid = __nex_task_id();");
-    w.l("__nex_audit_capability(tid, \"fs.read\", &path);");
-    w.l("if !__nex_fs_read_allowed(&path) { panic!(\"NEX runtime: fs.read not allowed: {}\", path); }");
-    w.l("let s = fs::read_to_string(&path).unwrap_or_else(|_| \"\".to_string());");
-    w.l("__nex_charge_bytes(s.len() as u64);");
-    w.l("s");
+
+    w.l("let mut stack: Vec<__NexTaskId> = Vec::new();");
+    w.l("let mut order: Vec<__NexTaskId> = Vec::new();");
+    w.l("stack.push(root);");
+    w.l("while let Some(id) = stack.pop() {");
+    w.ind += 1;
+    w.l("order.push(id);");
+    w.l("let children = {");
+    w.ind += 1;
+    w.l("let reg = __nex_registry().lock().unwrap();");
+    w.l("reg.get(&id).map(|m| m.children.clone()).unwrap_or_default()");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("};");
+    w.l("for c in children { stack.push(c); }");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
+    w.l("order.reverse(); // postorder: children before parent");
+
+    w.l("let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();");
+    w.l("{");
+    w.ind += 1;
+    w.l("let mut reg = __nex_registry().lock().unwrap();");
+    w.l("for id in order {");
+    w.ind += 1;
+    w.l("if let Some(m) = reg.get_mut(&id) {");
+    w.ind += 1;
+    w.l("if let Some(h) = m.handle.take() { handles.push(h); }");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
+
+    w.l("for h in handles { let _ = h.join(); }");
+
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("");
 
+    w.l("fn cancelled() -> bool { __nex_get_current_token().is_cancelled() }");
+    w.l("");
+
+    w.l("fn join(t: __NexTask) { __nex_join_task_id(t.id); }");
+    w.l("");
+
+    w.l("fn cancel(t: &__NexTask) { __nex_cancel_subtree(t.id); }");
+    w.l("");
+
+    w.l("fn sleep_ms(ms: i64) { std::thread::sleep(Duration::from_millis(ms as u64)); }");
+    w.l("");
+
+    // ✅ FIX: accept String (because NEX String literals lower to String)
+    w.l("fn read_file(path: String) -> String {");
+    w.ind += 1;
+    w.l("let tid = __nex_get_current_task_id();");
+    w.l("__nex_audit_capability(tid, \"fs.read\", &path);");
+    w.l("if !__nex_fs_read_allowed(&path) {");
+    w.ind += 1;
+    w.l("panic!(\"NEX runtime: fs.read not allowed: {}\", path);");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
+    w.l("fs::read_to_string(&path).unwrap_or_else(|_| \"\".to_string())");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
+    w.l("");
+
+    // net.listen wrapper (+ audit)
     w.l("fn listen_http(port: i64) {");
     w.ind += 1;
-    w.l("__nex_consume_fuel(__NEX_FUEL_COST_CAPABILITY);");
-    w.l("__nex_charge_bytes(__NEX_MEM_COST_CAPABILITY_OVERHEAD);");
-    w.l("let tid = __nex_task_id();");
+    w.l("let tid = __nex_get_current_task_id();");
     w.l("__nex_audit_capability(tid, \"net.listen\", &format!(\"{}\", port));");
-    w.l("if !__nex_net_listen_allowed(port) { panic!(\"NEX runtime: net.listen not allowed: {}\", port); }");
+    w.l("if !__nex_net_listen_allowed(port) {");
+    w.ind += 1;
+    w.l("panic!(\"NEX runtime: net.listen not allowed: {}\", port);");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
     w.l("// Placeholder: real network runtime comes later.");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.l("");
 
+    // print wrapper
     w.l("fn print(s: String) { println!(\"{}\", s); }");
     w.l("");
 
-    // Entry shim: catch resource sentinel to exit cleanly, not “user panic”.
+    // Entry shim
     w.l("fn main() {");
     w.ind += 1;
-    w.l("__nex_init_context(0, __NexCancelToken::new());");
-    w.l("let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { __nex_user_main(); }));");
+    w.l("__nex_set_current_task_id(0);");
+    w.l("__nex_set_current_token(__NexCancelToken::new());");
+    w.l("__nex_set_fuel(__NEX_DEFAULT_FUEL_BUDGET);");
+    w.l("let res = std::panic::catch_unwind(|| { __nex_user_main(); });");
     w.l("match res {");
     w.ind += 1;
-    w.l("Ok(_) => { __nex_cancel_subtree(0); __nex_join_subtree(0); }");
-    w.l("Err(p) => {");
+    w.l("Ok(_) => {");
     w.ind += 1;
-    w.l("if __nex_is_resource_panic(p.as_ref()) { __nex_cancel_subtree(0); __nex_join_subtree(0); return; }");
-    w.l("__nex_cancel_subtree(0); __nex_join_subtree(0); panic!(\"NEX runtime: user panic\");");
+    w.l("// Normal exit: enforce no-orphan-tasks invariant.");
+    w.l("__nex_cancel_subtree(0);");
+    w.l("__nex_join_subtree(0);");
+    w.ind = w.ind.saturating_sub(1);
+    w.l("}");
+    w.l("Err(_) => {");
+    w.ind += 1;
+    w.l("__nex_cancel_subtree(0);");
+    w.l("__nex_join_subtree(0);");
+    w.l("panic!(\"NEX runtime: user panic\");");
     w.ind = w.ind.saturating_sub(1);
     w.l("}");
     w.ind = w.ind.saturating_sub(1);
@@ -571,8 +547,10 @@ fn collect_cap_allowlists(program: &Program) -> (Vec<String>, Vec<i64>, Vec<(i64
 
     fs_globs.sort();
     fs_globs.dedup();
+
     net_ports.sort();
     net_ports.dedup();
+
     net_port_ranges.sort();
     net_port_ranges.dedup();
 
@@ -593,9 +571,6 @@ fn emit_function(w: &mut W, f: &Function) {
         emit_ret(&f.return_type)
     ));
     w.ind += 1;
-
-    // Fuel checkpoint at function entry
-    w.l("__nex_consume_fuel(__NEX_FUEL_COST_FN_ENTRY);");
 
     for s in &f.body.stmts {
         emit_stmt(w, s);
@@ -682,12 +657,6 @@ fn emit_stmt(w: &mut W, s: &Stmt) {
         Stmt::Loop(b) => {
             w.l("loop {");
             w.ind += 1;
-
-            // Fuel checkpoint per iteration (loop header)
-            w.l("__nex_consume_fuel(__NEX_FUEL_COST_LOOP_TICK);");
-            // Cooperativity for cancellation
-            w.l("if cancelled() { break; }");
-
             for st in &b.stmts {
                 emit_stmt(w, st);
             }
@@ -712,12 +681,7 @@ fn emit_expr(e: &Expr) -> String {
             Literal::Int(i) => format!("{}", i),
             Literal::Float(f) => format!("{}", f),
             Literal::Bool(b) => format!("{}", b),
-            Literal::String(s) => {
-                // Memory scaffolding: charge bytes when constructing a new String.
-                // Wrap in a block expression so we can do a statement before yielding a String.
-                let n = s.as_bytes().len() as u64;
-                format!("{{ __nex_charge_bytes({}); {:?}.to_string() }}", n, s)
-            }
+            Literal::String(s) => format!("{:?}.to_string()", s),
         },
         Expr::Variable(v) => v.clone(),
         Expr::Call { func, args, .. } => {
@@ -732,6 +696,7 @@ fn emit_expr(e: &Expr) -> String {
                 _ => func,
             };
 
+            // Special-case cancel: runtime signature is cancel(&__NexTask)
             if rust_fn == "cancel" && args.len() == 1 {
                 let a0 = emit_expr(&args[0]);
                 return format!("cancel(&{})", a0);
@@ -826,6 +791,7 @@ struct W {
     out: String,
     ind: usize,
 }
+
 impl W {
     fn new() -> Self {
         Self {
@@ -833,6 +799,7 @@ impl W {
             ind: 0,
         }
     }
+
     fn l(&mut self, s: &str) {
         for _ in 0..self.ind {
             self.out.push_str("    ");

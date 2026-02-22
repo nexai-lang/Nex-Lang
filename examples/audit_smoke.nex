@@ -1,0 +1,13 @@
+cap fs.read("examples/*.nex");
+
+fn main() !io !async {
+  let x = fs.read("examples/audit_smoke.nex");
+  print(x);
+
+  let t: task = spawn {
+    sleep_ms(10);
+    print("child done");
+  };
+
+  join(t);
+}

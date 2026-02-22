@@ -5,6 +5,7 @@ mod cli;
 mod codegen;
 mod lexer;
 mod parser;
+pub mod runtime;
 
 use clap::Parser as _;
 use cli::{Cli, Commands};
@@ -75,7 +76,8 @@ fn main() -> anyhow::Result<()> {
 
             checker::check(&program).map_err(|e| anyhow::anyhow!("❌ Check failed: {}", e))?;
 
-            let out_dir = write_generated_cargo_project(&program)?;
+            let out_dir = resolve_out_dir();
+            let out_dir = write_generated_cargo_project(&program, &out_dir)?;
             println!("✅ BUILD OK: {}", out_dir.display());
         }
 
@@ -96,7 +98,8 @@ fn main() -> anyhow::Result<()> {
             println!("Neural models: {:#?}", info.neural_models);
             println!("Functions: {:#?}", info.functions);
 
-            let out_dir = write_generated_cargo_project(&program)?;
+            let out_dir = resolve_out_dir();
+            let out_dir = write_generated_cargo_project(&program, &out_dir)?;
             run_generated_cargo(&out_dir)?;
         }
     }
@@ -120,14 +123,37 @@ fn render_parse_errors(errors: &[parser::ParseError]) -> String {
     msg
 }
 
-fn write_generated_cargo_project(program: &ast::Program) -> anyhow::Result<PathBuf> {
+/// v0.4.3: NEX_OUT_DIR contract.
+/// - Default output directory is `target/nex_out`.
+/// - If `NEX_OUT_DIR` is set and non-empty, we generate into that directory instead.
+///   This enables parallel runs/tests without shared workspace contention.
+fn resolve_out_dir() -> PathBuf {
+    match std::env::var("NEX_OUT_DIR") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => PathBuf::from("target").join("nex_out"),
+    }
+}
+
+/// v0.4.x tooling hardening:
+/// - Never assume out_dir or out_dir/src exists.
+/// - Write Cargo.toml + src/main.rs deterministically.
+/// - Preserve async-mode dependencies + sandbox_data copying.
+fn write_generated_cargo_project(
+    program: &ast::Program,
+    out_dir: &Path,
+) -> anyhow::Result<PathBuf> {
     let async_mode = has_async_main(program);
     let rust_code = codegen::generate_rust(program, async_mode);
 
-    let out_dir = PathBuf::from("target/nex_out");
+    let out_dir = out_dir.to_path_buf();
     let src_dir = out_dir.join("src");
-    fs::create_dir_all(&src_dir)?;
 
+    // ✅ Critical robustness: ensure directories exist.
+    fs::create_dir_all(&src_dir).map_err(|e| {
+        anyhow::anyhow!("❌ failed to create output directory {:?}: {}", src_dir, e)
+    })?;
+
+    // Deterministic Cargo.toml: async mode pulls tokio; otherwise std-only.
     let cargo_toml = if async_mode {
         r#"[package]
 name = "nex_out"
@@ -148,26 +174,42 @@ edition = "2021"
 "#
     };
 
-    fs::write(out_dir.join("Cargo.toml"), cargo_toml)?;
-    fs::write(src_dir.join("main.rs"), rust_code)?;
+    // Write files with clearer errors (helps under eye strain).
+    let cargo_path = out_dir.join("Cargo.toml");
+    fs::write(&cargo_path, cargo_toml)
+        .map_err(|e| anyhow::anyhow!("❌ failed to write {:?}: {}", cargo_path, e))?;
 
+    let main_rs_path = src_dir.join("main.rs");
+    fs::write(&main_rs_path, rust_code)
+        .map_err(|e| anyhow::anyhow!("❌ failed to write {:?}: {}", main_rs_path, e))?;
+
+    // Optional: copy sandbox_data into generated crate, if present.
     let host_sandbox = PathBuf::from("sandbox_data");
     if host_sandbox.exists() && host_sandbox.is_dir() {
         let dest = out_dir.join("sandbox_data");
-        copy_dir_recursive(&host_sandbox, &dest)?;
+        copy_dir_recursive(&host_sandbox, &dest)
+            .map_err(|e| anyhow::anyhow!("❌ failed to copy sandbox_data: {}", e))?;
     }
 
     Ok(out_dir)
 }
 
 fn run_generated_cargo(out_dir: &Path) -> anyhow::Result<()> {
+    if !out_dir.exists() {
+        return Err(anyhow::anyhow!(
+            "❌ internal error: output dir {:?} does not exist",
+            out_dir
+        ));
+    }
+
     let status = Command::new("cargo")
         .arg("run")
         .current_dir(out_dir)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()?;
+        .status()
+        .map_err(|e| anyhow::anyhow!("❌ failed to invoke cargo in {:?}: {}", out_dir, e))?;
 
     if !status.success() {
         return Err(anyhow::anyhow!("❌ generated program failed"));
