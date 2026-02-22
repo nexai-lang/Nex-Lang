@@ -1,98 +1,170 @@
 # NEX
 
-A deterministic, capability-safe, effect-typed systems language  
-for governed autonomous execution.
+**A deterministic, capability-safe, effect-typed systems language  
+for governed autonomous execution.**
 
 ---
 
 ## Overview
 
-NEX is an experimental execution language designed as a **secure substrate for autonomous agents**.
+NEX is an experimental execution language designed as a **secure substrate for autonomous agents and governed workloads**.
 
-It is not a scripting DSL and not a general-purpose programming language.
+It is **not**:
 
-NEX exists to answer a specific question:
+- A scripting DSL  
+- A general-purpose programming language  
+- A replacement for Rust  
+
+NEX exists to explore a specific question:
 
 > Can we build an execution environment that refuses unsafe behavior by construction?
 
-The language enforces explicit effects, deny-by-default capability security,
-structured concurrency, and bounded resource governance at runtime.
+The language enforces:
+
+- Explicit effect typing
+- Deny-by-default capability security
+- Structured concurrency (no orphan tasks)
+- Deterministic cancellation semantics
+- Bounded runtime resource governance
+- Machine-readable audit telemetry
+
+NEX programs either operate within declared authority — or they do not compile or execute.
 
 ---
 
-## Design Goals
+## Design Principles
 
-NEX is built around five core principles:
+NEX is built around five core principles.
 
 ### 1. Determinism Over Convenience
-No silent failure. No implicit capability escalation.
-All side effects must be declared explicitly.
+
+- No ambient authority  
+- No implicit side effects  
+- No silent failure  
+
+All authority must be declared.
+
+---
 
 ### 2. Capability Security (Deny-by-Default)
+
 File system and network access are not ambient.
-They must be declared via explicit capability policies.
 
-### 3. Effect Typing
-Functions must declare `!io` or `!async` when required.
-Transitive effect checking prevents hidden behavior.
-
-### 4. Structured Concurrency
-Tasks form a strict parent–child tree.
-No orphan threads. No detached background work.
-
-### 5. Governed Execution
-Execution is bounded by:
-- Cooperative fuel checkpoints
-- Memory ceilings
-- Deterministic cancellation semantics
-- Audit telemetry
-
----
-
-## Current Version
-
-**v0.4.3 – Governed Execution Kernel**
-
-This version includes:
-
-- Cooperative Fuel Model (v0.4.0)
-- Memory Governance
-- JSONL Audit Telemetry
-- BFS Subtree Cancellation
-- No-Orphan Task Enforcement
-- `NEX_OUT_DIR` workspace isolation
-- Deterministic golden test suite (fully green)
-
-NEX now behaves as a **bounded execution kernel** rather than a simple DSL.
-
----
-
-## Architecture
-
-Compilation pipeline:
-Lexer → Parser → AST → Semantic Checker → Rust Backend (Codegen)
-
-
-Runtime model:
-
-- Custom cancellation tokens (atomic flag based)
-- BFS subtree cancellation
-- Deterministic join ordering
-- Resource governance hooks injected at compile-time
-- JSONL machine-readable audit log
-
----
-
-## Example
+Capabilities must be declared explicitly:
 
 ```nex
+cap fs.read("examples/*.nex");
+
+Generated programs cannot exceed declared authority.
+
+
+### 3. Effect Typing
+
+Functions must declare required effects:
+
+fn main !async { }
+fn main !io { }
+
+Transitive effect checking prevents hidden behavior.
+
+
+### 4. Structured Concurrency
+
+Tasks form strict parent–child trees
+
+No detached background work
+
+No orphan threads
+
+Cancellation propagates breadth-first through the subtree.
+
+
+### 5. Governed Execution
+
+Runtime execution is bounded by:
+
+Cooperative fuel checkpoints
+
+Memory ceilings
+
+Deterministic cancellation
+
+JSONL audit telemetry
+
+NEX behaves as a bounded execution kernel, not just a DSL.
+
+
+## Current Version
+v0.4.3 — Governed Execution Kernel
+
+This release establishes deterministic governed execution boundaries.
+
+Includes:
+
+Cooperative Fuel Model
+
+Memory Governance
+
+JSONL Audit Telemetry
+
+BFS Subtree Cancellation
+
+No-Orphan Task Enforcement
+
+NEX_OUT_DIR isolated per-run workspace support
+
+Deterministic golden test suite (fully green)
+
+NEX now functions as a controlled execution substrate for autonomous workloads.
+
+## Architecture
+Compilation Pipeline
+
+
+.nex Source
+    ↓
+Lexer
+    ↓
+Parser
+    ↓
+AST Construction
+    ↓
+Semantic Checker
+    ↓
+Capability + Effect Validation
+    ↓
+Rust Backend (Codegen)
+    ↓
+Rust Compilation
+    ↓
+Governed Executable
+
+Runtime Model
+
+The generated runtime enforces:
+
+Atomic cancellation tokens
+
+Deterministic join ordering
+
+Resource governance hooks injected at compile-time
+
+Structured task registry
+
+JSON machine-readable audit logs
+
+All violations are recorded deterministically.
+
+Example
+Structured Concurrency
+
 fn main !async {
     spawn {
         print("child running");
     }
 }
 
-Capabilities must be declared explicitly:
+Explicit Capability Declaration
 
 cap fs.read("examples/*.nex");
 
@@ -101,35 +173,42 @@ fn main !io {
     print(content);
 }
 
+
 ## Running
 cargo build
 ./target/debug/nex check examples/demo.nex
 ./target/debug/nex run examples/demo.nex
 
-To isolate builds:
+## Isolated Builds
+
+#Per-run workspaces:
 
 NEX_OUT_DIR=target/run_1 ./target/debug/nex run examples/demo.nex
 
-To control resource budgets:
+##Resource Budgets
 
 NEX_FUEL_BUDGET=1000
 NEX_MEM_BUDGET=1024
 NEX_AUDIT_PATH=audit.jsonl
 
-##What NEX Is Not
+## Security Model
 
-Not a general-purpose language
+# NEX enforces authority at compile time and runtime:
 
-Not a replacement for Rust
+Capabilities must be declared explicitly
 
-Not an interpreted sandbox
+Effects must be declared at function boundaries
 
-Not a toy DSL
+Network ports must be statically provable
 
-NEX is a controlled execution layer for autonomous workloads.
+File access must match declared glob patterns
 
-## Roadmap
-v0.5.x – Observability & Replay
+No detached tasks (structured concurrency invariant)
+
+The compiler guarantees that generated programs cannot exceed declared authority.
+
+Roadmap
+v0.5.x — Observability & Replay
 
 Run envelope events
 
@@ -137,25 +216,26 @@ Event sequencing
 
 Deterministic replay harness
 
-v0.6.x – Stable IR & Tool Ecosystem
+v0.6.x — Stable IR & Tooling
 
 Stable HIR/MIR
 
+Tool ecosystem
+
 Safe web/search tools
 
-v0.7.x – Multi-Agent Execution
+v0.7.x — Multi-Agent Execution
 
 Swarm governance
 
 Verified self-improvement boundaries
 
-v1.0 – Production-Grade Governed Kernel
+v1.0 — Production-Grade Governed Kernel
 Status
 
-This project is experimental.
+NEX is experimental.
 
 It is a research-driven systems exploration into safe autonomous execution.
-
 ---
 
 ## License
