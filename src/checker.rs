@@ -154,7 +154,11 @@ fn block_always_returns(b: &Block) -> bool {
 fn stmt_always_returns(s: &Stmt) -> bool {
     match s {
         Stmt::Return(_) => true,
-        Stmt::If { then_block, else_block, .. } => {
+        Stmt::If {
+            then_block,
+            else_block,
+            ..
+        } => {
             if let Some(eb) = else_block {
                 block_always_returns(then_block) && block_always_returns(eb)
             } else {
@@ -167,7 +171,6 @@ fn stmt_always_returns(s: &Stmt) -> bool {
         Stmt::Let { .. } | Stmt::Expr(_) => false,
     }
 }
-
 
 // -------------------- Builtins table --------------------
 
@@ -237,7 +240,6 @@ fn builtin_sig(name: &str) -> Option<BuiltinSig> {
 
 // -------------------- Capability checks --------------------
 
-
 fn __nex_normalize_rel_path_keep_glob(input: &str) -> Option<String> {
     // Allows relative paths + glob chars (*, ?) but blocks traversal/absolute/drive.
     let mut x = input.trim().replace('\\', "/");
@@ -303,12 +305,12 @@ fn __nex_glob_match(pat: &str, text: &str) -> bool {
     i == pb.len()
 }
 
-
-
 fn capability_sort_key(c: &Capability) -> String {
     match c {
         Capability::FsRead { glob } => format!("fs.read({})", glob),
-        Capability::NetListen { range } => format!("net.listen({})", net_port_spec_to_string(range)),
+        Capability::NetListen { range } => {
+            format!("net.listen({})", net_port_spec_to_string(range))
+        }
     }
 }
 
@@ -318,7 +320,10 @@ fn require_fs_read_capability(declared_caps: &[Capability], path: &str) -> Resul
         None => {
             return Err(CheckError {
                 message: format!("❌ fs.read blocked: unsafe path `{}`.", path),
-                hint: Some("Use a safe relative path like `logs/a.txt` (no `..`, no absolute paths).".to_string()),
+                hint: Some(
+                    "Use a safe relative path like `logs/a.txt` (no `..`, no absolute paths)."
+                        .to_string(),
+                ),
                 cause: Some("path normalization rejected the input".to_string()),
                 span: None,
                 note_span: None,
@@ -346,7 +351,10 @@ fn require_fs_read_capability(declared_caps: &[Capability], path: &str) -> Resul
     }
 
     Err(CheckError {
-        message: format!("❌ Capability missing: need `cap fs.read(\"{}\")` (or a matching glob).", path),
+        message: format!(
+            "❌ Capability missing: need `cap fs.read(\"{}\")` (or a matching glob).",
+            path
+        ),
         hint: Some("Example: cap fs.read(\"logs/*.txt\"); or cap fs.read(\"*\");".to_string()),
         cause: Some("missing capability".to_string()),
         span: None,
@@ -355,8 +363,10 @@ fn require_fs_read_capability(declared_caps: &[Capability], path: &str) -> Resul
     })
 }
 
-
-fn require_net_listen_capability(declared_caps: &[Capability], port: i64) -> Result<(), CheckError> {
+fn require_net_listen_capability(
+    declared_caps: &[Capability],
+    port: i64,
+) -> Result<(), CheckError> {
     for c in declared_caps {
         if let Capability::NetListen { range } = c {
             if net_port_spec_allows(range, port) {
@@ -365,7 +375,10 @@ fn require_net_listen_capability(declared_caps: &[Capability], port: i64) -> Res
         }
     }
     Err(CheckError {
-        message: format!("❌ Capability missing: no `cap net.listen(...)` allows port {}.", port),
+        message: format!(
+            "❌ Capability missing: no `cap net.listen(...)` allows port {}.",
+            port
+        ),
         hint: Some("Example: cap net.listen(8080); or cap net.listen(8000..9000);".to_string()),
         cause: Some("missing capability".to_string()),
         span: None,
@@ -373,8 +386,6 @@ fn require_net_listen_capability(declared_caps: &[Capability], port: i64) -> Res
         note: None,
     })
 }
-
-
 
 fn net_port_spec_to_string(r: &NetPortSpec) -> String {
     match r {
@@ -395,8 +406,14 @@ fn net_port_spec_allows(r: &NetPortSpec, port: i64) -> bool {
 fn render_error_list(mut errs: Vec<CheckError>) -> CheckError {
     // Keep deterministic ordering by span (line/col) when available, then message
     errs.sort_by(|a, b| {
-        let ak = a.span.map(|s| (s.line, s.col)).unwrap_or((usize::MAX, usize::MAX));
-        let bk = b.span.map(|s| (s.line, s.col)).unwrap_or((usize::MAX, usize::MAX));
+        let ak = a
+            .span
+            .map(|s| (s.line, s.col))
+            .unwrap_or((usize::MAX, usize::MAX));
+        let bk = b
+            .span
+            .map(|s| (s.line, s.col))
+            .unwrap_or((usize::MAX, usize::MAX));
         ak.cmp(&bk).then(a.message.cmp(&b.message))
     });
 
@@ -415,7 +432,10 @@ fn render_error_list(mut errs: Vec<CheckError>) -> CheckError {
             msg.push_str(&format!("Cause: {}\n", c));
         }
         if let Some(sp) = e.note_span {
-            msg.push_str(&format!("Note location: line {}, col {}\n", sp.line, sp.col));
+            msg.push_str(&format!(
+                "Note location: line {}, col {}\n",
+                sp.line, sp.col
+            ));
         }
         if let Some(n) = &e.note {
             msg.push_str(&format!("Note: {}\n", n));
@@ -436,6 +456,7 @@ fn render_error_list(mut errs: Vec<CheckError>) -> CheckError {
 // -------------------- Step 45: User function signatures --------------------
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct FnSig {
     name_span: Span,
     params: Vec<SimpleType>,
@@ -468,18 +489,34 @@ fn missing_effects(required: DeclaredEffects, declared: DeclaredEffects) -> Miss
 }
 
 // Step 46: infer transitive effects via call graph (fixed point)
-fn collect_direct_effects_and_calls_block(b: &Block, direct: &mut DeclaredEffects, calls: &mut Vec<String>) {
+fn collect_direct_effects_and_calls_block(
+    b: &Block,
+    direct: &mut DeclaredEffects,
+    calls: &mut Vec<String>,
+) {
     for s in &b.stmts {
         collect_direct_effects_and_calls_stmt(s, direct, calls);
     }
 }
 
-fn collect_direct_effects_and_calls_stmt(s: &Stmt, direct: &mut DeclaredEffects, calls: &mut Vec<String>) {
+fn collect_direct_effects_and_calls_stmt(
+    s: &Stmt,
+    direct: &mut DeclaredEffects,
+    calls: &mut Vec<String>,
+) {
     match s {
         Stmt::Let { value, .. } => collect_direct_effects_and_calls_expr(value, direct, calls),
-        Stmt::Return(e) => { if let Some(ex) = e { collect_direct_effects_and_calls_expr(ex, direct, calls) } },
+        Stmt::Return(e) => {
+            if let Some(ex) = e {
+                collect_direct_effects_and_calls_expr(ex, direct, calls)
+            }
+        }
         Stmt::Expr(e) => collect_direct_effects_and_calls_expr(e, direct, calls),
-        Stmt::If { cond, then_block, else_block } => {
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
             collect_direct_effects_and_calls_expr(cond, direct, calls);
             collect_direct_effects_and_calls_block(then_block, direct, calls);
             if let Some(b) = else_block {
@@ -491,14 +528,22 @@ fn collect_direct_effects_and_calls_stmt(s: &Stmt, direct: &mut DeclaredEffects,
     }
 }
 
-fn collect_direct_effects_and_calls_expr(e: &Expr, direct: &mut DeclaredEffects, calls: &mut Vec<String>) {
+fn collect_direct_effects_and_calls_expr(
+    e: &Expr,
+    direct: &mut DeclaredEffects,
+    calls: &mut Vec<String>,
+) {
     match e {
         Expr::Literal(_) | Expr::Variable(_) => {}
         Expr::BinaryOp { left, right, .. } => {
             collect_direct_effects_and_calls_expr(left, direct, calls);
             collect_direct_effects_and_calls_expr(right, direct, calls);
         }
-        Expr::If { cond, then_block, else_block } => {
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
             collect_direct_effects_and_calls_expr(cond, direct, calls);
             collect_direct_effects_and_calls_block(then_block, direct, calls);
             if let Some(b) = else_block {
@@ -531,7 +576,9 @@ fn collect_direct_effects_and_calls_expr(e: &Expr, direct: &mut DeclaredEffects,
     }
 }
 
-fn infer_transitive_effects(fn_bodies: &HashMap<String, Function>) -> HashMap<String, DeclaredEffects> {
+fn infer_transitive_effects(
+    fn_bodies: &HashMap<String, Function>,
+) -> HashMap<String, DeclaredEffects> {
     let mut direct: HashMap<String, DeclaredEffects> = HashMap::new();
     let mut calls: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -674,10 +721,7 @@ pub fn check(program: &Program) -> Result<CheckResult, CheckError> {
     // Validate each function signature includes all required effects.
     for fn_name in &funcs {
         let f = fn_bodies.get(fn_name).unwrap();
-        let declared = fn_sigs
-            .get(fn_name)
-            .map(|s| s.effects)
-            .unwrap_or_default();
+        let declared = fn_sigs.get(fn_name).map(|s| s.effects).unwrap_or_default();
 
         let required = inferred_effects.get(fn_name).copied().unwrap_or_default();
         let miss = missing_effects(required, declared);
@@ -700,10 +744,7 @@ pub fn check(program: &Program) -> Result<CheckResult, CheckError> {
 
     for fn_name in &funcs {
         let f = fn_bodies.get(fn_name).unwrap();
-        let declared = fn_sigs
-            .get(fn_name)
-            .map(|s| s.effects)
-            .unwrap_or_default();
+        let declared = fn_sigs.get(fn_name).map(|s| s.effects).unwrap_or_default();
 
         let mut errs = check_function_collect(f, &caps, declared, &fn_sigs, &inferred_effects);
         all_errors.append(&mut errs);
@@ -919,38 +960,40 @@ fn walk_stmt_collect(
             }
             if let Some(expr) = ret {
                 let got = infer_expr_type(expr, env, fn_sigs);
-            if declared_ret != SimpleType::Void
-                && got != SimpleType::Unknown
-                && declared_ret != SimpleType::Unknown
-                && got != declared_ret
-            {
-                errs.push(CheckError {
-                    message: format!(
-                        "❌ Return type error: fn `{}` declares `{}` but returned `{}`.",
-                        fn_name,
-                        simple_type_name(declared_ret),
-                        simple_type_name(got)
-                    ),
-                    hint: Some("Return a value matching the declared return type.".to_string()),
-                    cause: Some("return type mismatch".to_string()),
-                    span: None,
-                    note_span: Some(fn_name_span),
-                    note: Some("Fix the function return type or the returned expression.".to_string()),
-                });
-            }
+                if declared_ret != SimpleType::Void
+                    && got != SimpleType::Unknown
+                    && declared_ret != SimpleType::Unknown
+                    && got != declared_ret
+                {
+                    errs.push(CheckError {
+                        message: format!(
+                            "❌ Return type error: fn `{}` declares `{}` but returned `{}`.",
+                            fn_name,
+                            simple_type_name(declared_ret),
+                            simple_type_name(got)
+                        ),
+                        hint: Some("Return a value matching the declared return type.".to_string()),
+                        cause: Some("return type mismatch".to_string()),
+                        span: None,
+                        note_span: Some(fn_name_span),
+                        note: Some(
+                            "Fix the function return type or the returned expression.".to_string(),
+                        ),
+                    });
+                }
                 walk_expr_collect(
                     expr,
-                declared_caps,
-                declared,
-                fn_sigs,
-                inferred_effects,
-                reported,
-                missing,
-                env,
-                errs,
-                fn_name,
-                fn_name_span,
-            );
+                    declared_caps,
+                    declared,
+                    fn_sigs,
+                    inferred_effects,
+                    reported,
+                    missing,
+                    env,
+                    errs,
+                    fn_name,
+                    fn_name_span,
+                );
             }
         }
 
@@ -970,7 +1013,11 @@ fn walk_stmt_collect(
             );
         }
 
-        Stmt::If { cond, then_block, else_block } => {
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
             walk_expr_collect(
                 cond,
                 declared_caps,
@@ -1053,25 +1100,107 @@ fn walk_expr_collect(
         Expr::Literal(_) | Expr::Variable(_) => {}
 
         Expr::BinaryOp { left, right, .. } => {
-            walk_expr_collect(left, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span);
-            walk_expr_collect(right, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name, fn_name_span);
+            walk_expr_collect(
+                left,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name.clone(),
+                fn_name_span,
+            );
+            walk_expr_collect(
+                right,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name,
+                fn_name_span,
+            );
         }
 
-        Expr::If { cond, then_block, else_block } => {
-            walk_expr_collect(cond, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span);
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            walk_expr_collect(
+                cond,
+                declared_caps,
+                declared,
+                fn_sigs,
+                inferred_effects,
+                reported,
+                missing,
+                env,
+                errs,
+                fn_name.clone(),
+                fn_name_span,
+            );
             for s in &then_block.stmts {
-                walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+                walk_stmt_collect(
+                    s,
+                    declared_caps,
+                    declared,
+                    fn_sigs,
+                    inferred_effects,
+                    reported,
+                    missing,
+                    env,
+                    errs,
+                    fn_name.clone(),
+                    fn_name_span,
+                    SimpleType::Void,
+                    &mut false,
+                );
             }
             if let Some(b) = else_block {
                 for s in &b.stmts {
-                    walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+                    walk_stmt_collect(
+                        s,
+                        declared_caps,
+                        declared,
+                        fn_sigs,
+                        inferred_effects,
+                        reported,
+                        missing,
+                        env,
+                        errs,
+                        fn_name.clone(),
+                        fn_name_span,
+                        SimpleType::Void,
+                        &mut false,
+                    );
                 }
             }
         }
 
         Expr::Block(b) => {
             for s in &b.stmts {
-                walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+                walk_stmt_collect(
+                    s,
+                    declared_caps,
+                    declared,
+                    fn_sigs,
+                    inferred_effects,
+                    reported,
+                    missing,
+                    env,
+                    errs,
+                    fn_name.clone(),
+                    fn_name_span,
+                    SimpleType::Void,
+                    &mut false,
+                );
             }
         }
 
@@ -1091,24 +1220,74 @@ fn walk_expr_collect(
                 }
             }
             for s in &block.stmts {
-                walk_stmt_collect(s, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span, SimpleType::Void, &mut false);
+                walk_stmt_collect(
+                    s,
+                    declared_caps,
+                    declared,
+                    fn_sigs,
+                    inferred_effects,
+                    reported,
+                    missing,
+                    env,
+                    errs,
+                    fn_name.clone(),
+                    fn_name_span,
+                    SimpleType::Void,
+                    &mut false,
+                );
             }
         }
 
         Expr::Call { func, args, span } => {
             // Builtins
             if let Some(sig) = builtin_sig(func) {
-                enforce_effects(sig.needs_io, sig.needs_net, sig.needs_async, declared, reported, missing, errs, func, *span, fn_name_span);
-                enforce_call_arity_and_types(sig.params, func, args, env, fn_sigs, errs, *span, fn_name_span);
+                enforce_effects(
+                    sig.needs_io,
+                    sig.needs_net,
+                    sig.needs_async,
+                    declared,
+                    reported,
+                    missing,
+                    errs,
+                    func,
+                    *span,
+                    fn_name_span,
+                );
+                enforce_call_arity_and_types(
+                    sig.params,
+                    func,
+                    args,
+                    env,
+                    fn_sigs,
+                    errs,
+                    *span,
+                    fn_name_span,
+                );
             }
             // User functions (Step 45 + Step 46 inferred effects)
             else if let Some(sig) = fn_sigs.get(func) {
                 let req = inferred_effects.get(func).copied().unwrap_or(sig.effects);
-                enforce_effects(req.io, req.net, req.r#async, declared, reported, missing, errs, func, *span, fn_name_span);
+                enforce_effects(
+                    req.io,
+                    req.net,
+                    req.r#async,
+                    declared,
+                    reported,
+                    missing,
+                    errs,
+                    func,
+                    *span,
+                    fn_name_span,
+                );
 
                 if args.len() != sig.params.len() {
                     errs.push(CheckError {
-                        message: format!("❌ Call error: `{}` expects {} argument(s) but got {}.", func, sig.params.len(), args.len()),
+                        message: format!(
+                            "❌ Call error: `{}` expects {} argument(s) but got {}.",
+                            func,
+                            sig.params.len(),
+                            args.len()
+                        ),
                         hint: Some("Fix the call argument count.".to_string()),
                         cause: Some(format!("call `{}`", func)),
                         span: Some(*span),
@@ -1127,7 +1306,10 @@ fn walk_expr_collect(
                             }
                         }
 
-                        if *want != SimpleType::Unknown && got != SimpleType::Unknown && got != *want {
+                        if *want != SimpleType::Unknown
+                            && got != SimpleType::Unknown
+                            && got != *want
+                        {
                             errs.push(CheckError {
                                 message: format!(
                                     "❌ Type error: arg {} of `{}` expected `{}` but got `{}`.",
@@ -1153,7 +1335,9 @@ fn walk_expr_collect(
                     if let Err(mut e) = require_fs_read_capability(declared_caps, path) {
                         e.span = Some(*span);
                         e.note_span = Some(fn_name_span);
-                        e.note = Some("Add a matching capability and `!io` to this function.".to_string());
+                        e.note = Some(
+                            "Add a matching capability and `!io` to this function.".to_string(),
+                        );
                         errs.push(e);
                     }
                 }
@@ -1163,14 +1347,28 @@ fn walk_expr_collect(
                     if let Err(mut e) = require_net_listen_capability(declared_caps, *port) {
                         e.span = Some(*span);
                         e.note_span = Some(fn_name_span);
-                        e.note = Some("Add a matching capability and `!net` to this function.".to_string());
+                        e.note = Some(
+                            "Add a matching capability and `!net` to this function.".to_string(),
+                        );
                         errs.push(e);
                     }
                 }
             }
 
             for a in args {
-                walk_expr_collect(a, declared_caps, declared, fn_sigs, inferred_effects, reported, missing, env, errs, fn_name.clone(), fn_name_span);
+                walk_expr_collect(
+                    a,
+                    declared_caps,
+                    declared,
+                    fn_sigs,
+                    inferred_effects,
+                    reported,
+                    missing,
+                    env,
+                    errs,
+                    fn_name.clone(),
+                    fn_name_span,
+                );
             }
         }
     }
@@ -1193,7 +1391,10 @@ fn enforce_effects(
         if !reported.io {
             reported.io = true;
             errs.push(CheckError {
-                message: format!("❌ Effect violation: `{}` requires `!io` on the enclosing function.", func),
+                message: format!(
+                    "❌ Effect violation: `{}` requires `!io` on the enclosing function.",
+                    func
+                ),
                 hint: Some("Add `!io` to the function signature.".to_string()),
                 cause: Some(format!("call `{}`", func)),
                 span: Some(call_span),
@@ -1207,7 +1408,10 @@ fn enforce_effects(
         if !reported.net {
             reported.net = true;
             errs.push(CheckError {
-                message: format!("❌ Effect violation: `{}` requires `!net` on the enclosing function.", func),
+                message: format!(
+                    "❌ Effect violation: `{}` requires `!net` on the enclosing function.",
+                    func
+                ),
                 hint: Some("Add `!net` to the function signature.".to_string()),
                 cause: Some(format!("call `{}`", func)),
                 span: Some(call_span),
@@ -1221,7 +1425,10 @@ fn enforce_effects(
         if !reported.r#async {
             reported.r#async = true;
             errs.push(CheckError {
-                message: format!("❌ Effect violation: `{}` requires `!async` on the enclosing function.", func),
+                message: format!(
+                    "❌ Effect violation: `{}` requires `!async` on the enclosing function.",
+                    func
+                ),
                 hint: Some("Add `!async` to the function signature.".to_string()),
                 cause: Some(format!("call `{}`", func)),
                 span: Some(call_span),
@@ -1244,7 +1451,12 @@ fn enforce_call_arity_and_types(
 ) {
     if args.len() != params.len() {
         errs.push(CheckError {
-            message: format!("❌ Call error: `{}` expects {} argument(s) but got {}.", func, params.len(), args.len()),
+            message: format!(
+                "❌ Call error: `{}` expects {} argument(s) but got {}.",
+                func,
+                params.len(),
+                args.len()
+            ),
             hint: Some("Fix the call argument count.".to_string()),
             cause: Some(format!("call `{}`", func)),
             span: Some(call_span),

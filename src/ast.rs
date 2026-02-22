@@ -139,6 +139,7 @@ pub enum NetPortSpec {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct NeuralDecl {
     pub name: String,
     pub params: Vec<Param>,
