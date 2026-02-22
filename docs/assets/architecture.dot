@@ -1,0 +1,17 @@
+digraph NEX {
+    rankdir=TB;
+    node [shape=box, style="rounded,filled", fillcolor="#1e1e1e", fontcolor="white", color="#888888"];
+
+    A [label=".nex Source File"];
+    B [label="Lexer"];
+    C [label="Parser"];
+    D [label="AST Construction"];
+    E [label="Semantic Checker"];
+    F [label="Capability Validation"];
+    G [label="Effect Enforcement"];
+    H [label="Rust Code Generation"];
+    I [label="Rust Compilation"];
+    J [label="Governed Executable"];
+
+    A -> B -> C -> D -> E -> F -> G -> H -> I -> J;
+}
