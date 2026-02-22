@@ -100,4 +100,8 @@ Planned improvements include:
 
 ## Acknowledgements
 
+<<<<<<< HEAD
 Security contributions are welcome. If you submit a report or patch, you may be credited in the changelog/release notes (at your preference).
+=======
+Security contributions are welcome. If you submit a report or patch, you may be credited in the changelog/release notes (at your preference).
+>>>>>>> 0f63f2a (docs: add architecture animation and update README)
