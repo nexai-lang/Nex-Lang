@@ -62,6 +62,14 @@ fn cancelled_in_main_runs() {
     assert!(ok, "expected success\n{}", combined(&stdout, &stderr));
 
     let all = format!("{stdout}\n{stderr}");
-    assert!(all.contains("✅ CHECK PASSED"), "missing check pass\n{}", combined(&stdout, &stderr));
-    assert!(all.contains("NOT CANCELLED"), "missing program output\n{}", combined(&stdout, &stderr));
+    assert!(
+        all.contains("✅ CHECK PASSED"),
+        "missing check pass\n{}",
+        combined(&stdout, &stderr)
+    );
+    assert!(
+        all.contains("NOT CANCELLED"),
+        "missing program output\n{}",
+        combined(&stdout, &stderr)
+    );
 }

@@ -108,7 +108,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok((out, sp))
             }
-            _ => self.err_here(format!("Expected string literal but got {:?}", self.cur.kind)),
+            _ => self.err_here(format!(
+                "Expected string literal but got {:?}",
+                self.cur.kind
+            )),
         }
     }
 
@@ -160,51 +163,55 @@ impl<'a> Parser<'a> {
         } else if self.at(Token::Neural) {
             Ok(Item::Neural(self.parse_neural_decl()?))
         } else {
-            self.err_here(format!("Unexpected token at top-level: {:?}", self.cur.kind))
+            self.err_here(format!(
+                "Unexpected token at top-level: {:?}",
+                self.cur.kind
+            ))
         }
     }
 
     // cap fs.read("..."); | cap net.listen(8080);
-  fn parse_cap_decl(&mut self) -> PResult<CapabilityDecl> {
-    self.expect(Token::Cap)?;
+    fn parse_cap_decl(&mut self) -> PResult<CapabilityDecl> {
+        self.expect(Token::Cap)?;
 
-    let (a, _) = self.expect_ident()?;
-    self.expect(Token::Dot)?;
-    let (b, _) = self.expect_ident()?;
-    self.expect(Token::LParen)?;
+        let (a, _) = self.expect_ident()?;
+        self.expect(Token::Dot)?;
+        let (b, _) = self.expect_ident()?;
+        self.expect(Token::LParen)?;
 
-    let cap = match (a.as_str(), b.as_str()) {
-        ("fs", "read") => {
-            let (glob, _) = self.expect_string()?;
-            self.expect(Token::RParen)?;
-            self.expect(Token::Semi)?;
-            Capability::FsRead { glob }
-        }
-        ("net", "listen") => {
-            let (start, _) = self.expect_int()?;
+        let cap = match (a.as_str(), b.as_str()) {
+            ("fs", "read") => {
+                let (glob, _) = self.expect_string()?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::Semi)?;
+                Capability::FsRead { glob }
+            }
+            ("net", "listen") => {
+                let (start, _) = self.expect_int()?;
 
-            // Check if it's a range: 8000..9000
-            let range = if self.consume(Token::Dot).is_some() {
-                self.expect(Token::Dot)?; // second dot
+                // Check if it's a range: 8000..9000
+                let range = if self.consume(Token::Dot).is_some() {
+                    self.expect(Token::Dot)?; // second dot
 
-                let (end, _) = self.expect_int()?;
-                NetPortSpec::Range(start, end)
-            } else {
-                NetPortSpec::Single(start)
-            };
+                    let (end, _) = self.expect_int()?;
+                    NetPortSpec::Range(start, end)
+                } else {
+                    NetPortSpec::Single(start)
+                };
 
-            self.expect(Token::RParen)?;
-            self.expect(Token::Semi)?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::Semi)?;
 
-            Capability::NetListen { range }
-        }
-        _ => return self.err_here(
-            "Unknown capability. Expected fs.read(...) or net.listen(...).",
-        ),
-    };
+                Capability::NetListen { range }
+            }
+            _ => {
+                return self
+                    .err_here("Unknown capability. Expected fs.read(...) or net.listen(...).")
+            }
+        };
 
-    Ok(CapabilityDecl { cap })
-}
+        Ok(CapabilityDecl { cap })
+    }
     // neural name(params): type { format "..."; path "..."; }
     fn parse_neural_decl(&mut self) -> PResult<NeuralDecl> {
         self.expect(Token::Neural)?;
@@ -619,7 +626,10 @@ impl<'a> Parser<'a> {
                 let b = self.parse_block()?;
                 Ok(Expr::Block(b))
             }
-            _ => self.err_here(format!("Unexpected token in expression: {:?}", self.cur.kind)),
+            _ => self.err_here(format!(
+                "Unexpected token in expression: {:?}",
+                self.cur.kind
+            )),
         }
     }
 }

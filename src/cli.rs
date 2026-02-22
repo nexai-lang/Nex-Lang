@@ -2,7 +2,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name="nex")]
+#[command(name = "nex")]
 #[command(about="NEX language toolchain (MVP)", long_about=None)]
 pub struct Cli {
     #[command(subcommand)]

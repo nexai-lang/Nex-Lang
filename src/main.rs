@@ -1,10 +1,10 @@
 // src/main.rs
 mod ast;
+mod checker;
 mod cli;
 mod codegen;
 mod lexer;
 mod parser;
-mod checker;
 
 use clap::Parser as _;
 use cli::{Cli, Commands};
@@ -58,7 +58,9 @@ fn main() -> anyhow::Result<()> {
             }
 
             if failed {
-                return Err(anyhow::anyhow!("❌ CHECK FAILED (parse and/or check errors)."));
+                return Err(anyhow::anyhow!(
+                    "❌ CHECK FAILED (parse and/or check errors)."
+                ));
             }
         }
 
@@ -86,7 +88,8 @@ fn main() -> anyhow::Result<()> {
                 return Err(anyhow::anyhow!("❌ Run aborted: parse errors."));
             }
 
-            let info = checker::check(&program).map_err(|e| anyhow::anyhow!("❌ Check failed: {}", e))?;
+            let info =
+                checker::check(&program).map_err(|e| anyhow::anyhow!("❌ Check failed: {}", e))?;
 
             println!("✅ CHECK PASSED");
             println!("Declared capabilities: {:#?}", info.capabilities);
