@@ -230,9 +230,7 @@ It is a research-driven systems exploration into safe autonomous execution.
 ## License
 
 Apache-2.0
-# Compiler Architecture
 
-NEX follows a deterministic, multi-stage compilation pipeline.
 
 
 ---
