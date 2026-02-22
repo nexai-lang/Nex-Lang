@@ -24,3 +24,12 @@ logs/
 # Runtime Logs
 # ===============================
 *.jsonl
+
+
+# Local debug dumps (do not commit)
+*_dump*.txt
+ast_dump.txt
+parser_dump.txt
+lexer_dump_*.txt
+checker_dump_*.txt
+codegen_dump_*.txt
