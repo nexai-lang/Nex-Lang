@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 ```markdown
 # NEX
 
