@@ -1,0 +1,9 @@
+cap fs.read("*");
+
+fn main() !async {
+  // allowed (if file exists in sandbox_data)
+  fs.read("hello.txt");
+
+  // denied (absolute path)
+  fs.read("/etc/passwd");
+}

@@ -1,250 +1,114 @@
-// src/main.rs
+// src/main.rs (crate root)
+
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use std::env;
+use std::path::PathBuf;
+
 mod ast;
 mod checker;
-mod cli;
 mod codegen;
 mod lexer;
 mod parser;
-pub mod runtime;
+mod replay;
+mod runtime;
 
-use clap::Parser as _;
-use cli::{Cli, Commands};
+fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
 
-use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+    if args.len() < 3 {
+        eprintln!("Usage:");
+        eprintln!("  nex run <file.nex>");
+        eprintln!("  nex replay <events.bin>");
+        std::process::exit(1);
+    }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Parse { file } => {
-            let src = fs::read_to_string(&file)?;
-            let (program, parse_errors) = parse_program_with_errors(&src);
-
-            if !parse_errors.is_empty() {
-                eprintln!("{}", render_parse_errors(&parse_errors));
-            }
-
-            println!("✅ Parsed AST:\n{:#?}", program);
-
-            if !parse_errors.is_empty() {
-                return Err(anyhow::anyhow!("❌ Parse had errors (see above)."));
-            }
-        }
-
-        Commands::Check { file } => {
-            let src = fs::read_to_string(&file)?;
-            let (program, parse_errors) = parse_program_with_errors(&src);
-
-            let mut failed = false;
-
-            if !parse_errors.is_empty() {
-                failed = true;
-                eprintln!("{}", render_parse_errors(&parse_errors));
-            }
-
-            match checker::check(&program) {
-                Ok(info) => {
-                    println!("✅ CHECK PASSED");
-                    println!("Declared capabilities: {:#?}", info.capabilities);
-                    println!("Neural models: {:#?}", info.neural_models);
-                    println!("Functions: {:#?}", info.functions);
-                }
-                Err(e) => {
-                    failed = true;
-                    eprintln!("❌ Check failed:\n{}", e);
-                }
-            }
-
-            if failed {
-                return Err(anyhow::anyhow!(
-                    "❌ CHECK FAILED (parse and/or check errors)."
-                ));
-            }
-        }
-
-        Commands::Build { file } => {
-            let src = fs::read_to_string(&file)?;
-            let (program, parse_errors) = parse_program_with_errors(&src);
-
-            if !parse_errors.is_empty() {
-                eprintln!("{}", render_parse_errors(&parse_errors));
-                return Err(anyhow::anyhow!("❌ Build aborted: parse errors."));
-            }
-
-            checker::check(&program).map_err(|e| anyhow::anyhow!("❌ Check failed: {}", e))?;
-
-            let out_dir = resolve_out_dir();
-            let out_dir = write_generated_cargo_project(&program, &out_dir)?;
-            println!("✅ BUILD OK: {}", out_dir.display());
-        }
-
-        Commands::Run { file } => {
-            let src = fs::read_to_string(&file)?;
-            let (program, parse_errors) = parse_program_with_errors(&src);
-
-            if !parse_errors.is_empty() {
-                eprintln!("{}", render_parse_errors(&parse_errors));
-                return Err(anyhow::anyhow!("❌ Run aborted: parse errors."));
-            }
-
-            let info =
-                checker::check(&program).map_err(|e| anyhow::anyhow!("❌ Check failed: {}", e))?;
-
-            println!("✅ CHECK PASSED");
-            println!("Declared capabilities: {:#?}", info.capabilities);
-            println!("Neural models: {:#?}", info.neural_models);
-            println!("Functions: {:#?}", info.functions);
-
-            let out_dir = resolve_out_dir();
-            let out_dir = write_generated_cargo_project(&program, &out_dir)?;
-            run_generated_cargo(&out_dir)?;
+    match args[1].as_str() {
+        "run" => cmd_run(&args[2]),
+        "replay" => cmd_replay(&args[2]),
+        other => {
+            eprintln!("Unknown command: {other}");
+            std::process::exit(1);
         }
     }
-
-    Ok(())
 }
 
-fn parse_program_with_errors(src: &str) -> (ast::Program, Vec<parser::ParseError>) {
-    let lexer = lexer::Lexer::new(src);
-    let mut parser = parser::Parser::new(lexer);
-    parser.parse_program_recovering()
-}
+fn cmd_run(file: &str) -> Result<()> {
+    let src = std::fs::read_to_string(file)
+        .with_context(|| format!("Failed to read source file: {file}"))?;
 
-fn render_parse_errors(errors: &[parser::ParseError]) -> String {
-    let mut msg = String::new();
-    msg.push_str(&format!("❌ Parse reported {} error(s):\n", errors.len()));
-    for (i, e) in errors.iter().enumerate() {
-        msg.push_str(&format!("\n---- Parse Error {} ----\n", i + 1));
-        msg.push_str(&format!("{}", e));
-    }
-    msg
-}
+    let program = parser::parse(&src).map_err(|e| anyhow::anyhow!(e))?;
+    let check = checker::check(&program).map_err(|e| anyhow::anyhow!(e))?;
 
-/// v0.4.3: NEX_OUT_DIR contract.
-/// - Default output directory is `target/nex_out`.
-/// - If `NEX_OUT_DIR` is set and non-empty, we generate into that directory instead.
-///   This enables parallel runs/tests without shared workspace contention.
-fn resolve_out_dir() -> PathBuf {
-    match std::env::var("NEX_OUT_DIR") {
-        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
-        _ => PathBuf::from("target").join("nex_out"),
-    }
-}
+    println!("✅ CHECK PASSED");
+    println!("Declared capabilities: {:?}", check.capabilities);
+    println!("Neural models: {:?}", check.neural_models);
+    println!("Functions: {:?}", check.functions);
 
-/// v0.4.x tooling hardening:
-/// - Never assume out_dir or out_dir/src exists.
-/// - Write Cargo.toml + src/main.rs deterministically.
-/// - Preserve async-mode dependencies + sandbox_data copying.
-fn write_generated_cargo_project(
-    program: &ast::Program,
-    out_dir: &Path,
-) -> anyhow::Result<PathBuf> {
-    let async_mode = has_async_main(program);
-    let rust_code = codegen::generate_rust(program, async_mode);
+    let build_dir = resolve_build_dir();
+    let runtime_out_dir = resolve_out_dir();
 
-    let out_dir = out_dir.to_path_buf();
-    let src_dir = out_dir.join("src");
+    let codegen_hash = sha256_32(b"NEX_CODEGEN_V0_5_7_CANON");
+    let source_hash = sha256_32(src.as_bytes());
 
-    // ✅ Critical robustness: ensure directories exist.
-    fs::create_dir_all(&src_dir).map_err(|e| {
-        anyhow::anyhow!("❌ failed to create output directory {:?}: {}", src_dir, e)
-    })?;
+    codegen::build_project(
+        &program,
+        &build_dir,
+        &runtime_out_dir,
+        codegen_hash,
+        source_hash,
+    )?;
 
-    // Deterministic Cargo.toml: async mode pulls tokio; otherwise std-only.
-    let cargo_toml = if async_mode {
-        r#"[package]
-name = "nex_out"
-version = "0.1.0"
-edition = "2021"
+    let bin_path = build_dir.join("target").join("debug").join("nex_out");
 
-[dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-tokio-util = "0.7"
-"#
-    } else {
-        r#"[package]
-name = "nex_out"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-"#
-    };
-
-    // Write files with clearer errors (helps under eye strain).
-    let cargo_path = out_dir.join("Cargo.toml");
-    fs::write(&cargo_path, cargo_toml)
-        .map_err(|e| anyhow::anyhow!("❌ failed to write {:?}: {}", cargo_path, e))?;
-
-    let main_rs_path = src_dir.join("main.rs");
-    fs::write(&main_rs_path, rust_code)
-        .map_err(|e| anyhow::anyhow!("❌ failed to write {:?}: {}", main_rs_path, e))?;
-
-    // Optional: copy sandbox_data into generated crate, if present.
-    let host_sandbox = PathBuf::from("sandbox_data");
-    if host_sandbox.exists() && host_sandbox.is_dir() {
-        let dest = out_dir.join("sandbox_data");
-        copy_dir_recursive(&host_sandbox, &dest)
-            .map_err(|e| anyhow::anyhow!("❌ failed to copy sandbox_data: {}", e))?;
-    }
-
-    Ok(out_dir)
-}
-
-fn run_generated_cargo(out_dir: &Path) -> anyhow::Result<()> {
-    if !out_dir.exists() {
-        return Err(anyhow::anyhow!(
-            "❌ internal error: output dir {:?} does not exist",
-            out_dir
-        ));
-    }
-
-    let status = Command::new("cargo")
-        .arg("run")
-        .current_dir(out_dir)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+    let status = std::process::Command::new(&bin_path)
+        .env("NEX_OUT_DIR", runtime_out_dir.to_string_lossy().to_string())
         .status()
-        .map_err(|e| anyhow::anyhow!("❌ failed to invoke cargo in {:?}: {}", out_dir, e))?;
+        .with_context(|| format!("Failed to execute runner: {}", bin_path.display()))?;
 
     if !status.success() {
-        return Err(anyhow::anyhow!("❌ generated program failed"));
+        std::process::exit(status.code().unwrap_or(1));
     }
+
     Ok(())
 }
 
-fn has_async_main(program: &ast::Program) -> bool {
-    for item in &program.items {
-        if let ast::Item::Function(f) = item {
-            if f.name == "main" {
-                return f.effects.iter().any(|e| matches!(e, ast::Effect::Async));
-            }
-        }
-    }
-    false
+fn cmd_replay(events_bin: &str) -> Result<()> {
+    let r = replay::verify_log(events_bin).map_err(|e| anyhow::anyhow!(e))?;
+
+    println!("✅ REPLAY OK");
+    println!("events_seen: {}", r.events_seen);
+    println!("run_finished_seq: {}", r.run_finished_seq);
+    println!("exit_code: {}", r.exit_code);
+    println!("run_hash_hex: {}", r.run_hash_hex);
+    println!("codegen_hash_hex: {}", r.codegen_hash_hex);
+    println!("source_hash_hex: {}", r.source_hash_hex);
+    println!("cap_allowed_total: {}", r.cap_allowed_total);
+    println!("cap_denied_total: {}", r.cap_denied_total);
+
+    Ok(())
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    if dst.exists() {
-        fs::remove_dir_all(dst)?;
-    }
-    fs::create_dir_all(dst)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-
-        if ty.is_dir() {
-            copy_dir_recursive(&src_path, &dst_path)?;
-        } else if ty.is_file() {
-            fs::copy(&src_path, &dst_path)?;
+fn resolve_build_dir() -> PathBuf {
+    if let Ok(v) = env::var("NEX_BUILD_DIR") {
+        if !v.trim().is_empty() {
+            return PathBuf::from(v);
         }
     }
-    Ok(())
+    PathBuf::from("/tmp/nex_build")
+}
+
+fn resolve_out_dir() -> PathBuf {
+    if let Ok(v) = env::var("NEX_OUT_DIR") {
+        if !v.trim().is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    PathBuf::from("./nex_out")
+}
+
+fn sha256_32(data: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().into()
 }

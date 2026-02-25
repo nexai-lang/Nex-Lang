@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // src/golden.rs
 //
 // v0.5.5 — Golden test upgrade (CI hardening)
@@ -8,9 +9,9 @@
 // tests/golden/<name>.nex.events.bin
 // tests/golden/<name>.nex.events.jsonl
 //
-// We verify byte-for-byte equality of binary and jsonl outputs.
-// This intentionally makes any change to log schema / ordering / hashing fail CI,
-// forcing explicit regeneration via --save-golden.
+// IMPORTANT FIX:
+// - If the test file is already in tests/golden/, DO NOT copy-to-self.
+//   Copy-to-self can corrupt/truncate the file on some systems.
 
 use std::fs;
 use std::io;
@@ -32,11 +33,10 @@ pub fn golden_paths_for(test_nex_path: &Path) -> io::Result<GoldenPaths> {
         .and_then(|s| s.to_str())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad test filename"))?;
 
-    // Expect <name>.nex
     if !name.ends_with(".nex") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "verify-golden expects a .nex file",
+            "expected a .nex file path",
         ));
     }
 
@@ -62,18 +62,38 @@ pub fn save_golden_artifacts(
     let gp = golden_paths_for(test_nex_path)?;
     fs::create_dir_all(&gp.golden_dir)?;
 
-    // Copy .nex into tests/golden if not already (canonical location for CI).
+    // Only copy the .nex into tests/golden if it is NOT already there.
+    // This avoids copy-to-self corruption.
     let dest_nex = gp.golden_dir.join(
         test_nex_path
             .file_name()
-            .expect("file name exists for test"),
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad test filename"))?,
     );
-    fs::copy(test_nex_path, &dest_nex)?;
+
+    let src_abs = fs::canonicalize(test_nex_path)?;
+    let dst_abs = if dest_nex.exists() {
+        fs::canonicalize(&dest_nex)?
+    } else {
+        // If it doesn't exist yet, canonicalize parent + filename
+        // by canonicalizing the parent directory.
+        let parent = dest_nex
+            .parent()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad dest path"))?;
+        fs::canonicalize(parent)?.join(
+            dest_nex
+                .file_name()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad dest filename"))?,
+        )
+    };
+
+    if src_abs != dst_abs {
+        fs::copy(test_nex_path, &dest_nex)?;
+    }
 
     // Save stdout
     fs::write(&gp.stdout, captured_stdout.as_bytes())?;
 
-    // Copy events
+    // Copy logs from run_out_dir
     let src_bin = run_out_dir.join("run.events.bin");
     let src_jsonl = run_out_dir.join("run.events.jsonl");
 
@@ -103,7 +123,7 @@ pub fn verify_golden_artifacts(
 ) -> io::Result<()> {
     let gp = golden_paths_for(test_nex_path)?;
 
-    // Ensure golden artifacts exist
+    // Must exist
     for p in [&gp.stdout, &gp.events_bin, &gp.events_jsonl] {
         if !p.exists() {
             return Err(io::Error::new(
@@ -116,16 +136,16 @@ pub fn verify_golden_artifacts(
         }
     }
 
-    // stdout must match
+    // stdout exact
     let golden_stdout = fs::read_to_string(&gp.stdout)?;
     if golden_stdout != captured_stdout {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "stdout mismatch vs golden (run with --save-golden to update)",
+            "stdout mismatch vs golden (re-run with --save-golden to update)",
         ));
     }
 
-    // binary log must match byte-for-byte
+    // logs exact
     let fresh_bin = run_out_dir.join("run.events.bin");
     let fresh_jsonl = run_out_dir.join("run.events.jsonl");
 
@@ -141,7 +161,7 @@ fn byte_eq_or_err(golden: &Path, fresh: &Path, label: &str) -> io::Result<()> {
     if a != b {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{label} mismatch vs golden (run with --save-golden to update)"),
+            format!("{label} mismatch vs golden (re-run with --save-golden to update)"),
         ));
     }
     Ok(())

@@ -1,0 +1,5 @@
+cap fs.read("sandbox_data/public/*");
+
+fn main() !io {
+  fs.read("sandbox_data/test.txt");
+}

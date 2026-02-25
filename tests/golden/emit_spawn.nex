@@ -1,0 +1,4 @@
+fn main() !async {
+  let t = spawn { };
+  join(t);
+}

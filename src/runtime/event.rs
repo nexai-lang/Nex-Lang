@@ -1,13 +1,13 @@
 // src/runtime/event.rs
 //
-// Deterministic, stable event format for NEX v0.5.x.
+// Deterministic, stable event format for NEX.
 //
 // Hard invariants supported here:
-// - I5 Deterministic codegen/runtime: explicit little-endian encoding.
-// - I9 Append-only logs: format is strictly sequential.
+// - I5 Deterministic runtime: explicit little-endian encoding.
+// - I9 Append-only logs: strictly sequential.
 // - No timestamps, no RNG, no usize/isize, no floats.
 //
-// NOTE: This module defines the *binary canonical* representation. JSONL is a view-layer sink later.
+// Canonical wire format. JSONL is a view-layer sink later.
 
 #![allow(dead_code)]
 
@@ -17,11 +17,10 @@ use core::fmt;
 pub const EVENT_MAGIC: [u8; 4] = *b"NEXE";
 
 /// Binary log format version.
-/// Bump only with a migration plan; treat as stable wire format.
 pub const EVENT_VERSION: u16 = 1;
 
 /// Event kind tags are stable numeric values.
-/// Do not reorder; only append new variants with new numeric tags.
+/// Never reorder; only append new variants with new numeric tags.
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EventKind {
@@ -30,6 +29,12 @@ pub enum EventKind {
     FuelExhausted = 3,
     ResourceViolation = 4,
     RunFinished = 5,
+
+    // ---- Path B lifecycle extensions (append-only) ----
+    TaskStarted = 6,
+    TaskFinished = 7,
+    TaskCancelled = 8,
+    TaskJoined = 9,
 }
 
 impl EventKind {
@@ -47,6 +52,10 @@ impl fmt::Display for EventKind {
             EventKind::FuelExhausted => "FuelExhausted",
             EventKind::ResourceViolation => "ResourceViolation",
             EventKind::RunFinished => "RunFinished",
+            EventKind::TaskStarted => "TaskStarted",
+            EventKind::TaskFinished => "TaskFinished",
+            EventKind::TaskCancelled => "TaskCancelled",
+            EventKind::TaskJoined => "TaskJoined",
         };
         f.write_str(s)
     }
@@ -81,19 +90,14 @@ impl EventHeader {
         i += 2;
 
         out[i..i + 4].copy_from_slice(&self.payload_len.to_le_bytes());
-        // i += 4;
-
         out
     }
 }
 
-/// A small helper trait for deterministic binary encoding.
-/// We deliberately avoid serde here to prevent accidental nondeterminism (maps, key order, etc.).
+/// Deterministic binary encoding helper.
+/// We avoid serde to prevent accidental nondeterminism.
 pub trait EncodeLE {
-    /// Encoded payload length in bytes.
     fn encoded_len(&self) -> usize;
-
-    /// Encode into `dst`. Must write exactly `encoded_len()` bytes.
     fn encode_le(&self, dst: &mut Vec<u8>);
 
     #[inline]
@@ -106,7 +110,6 @@ pub trait EncodeLE {
 }
 
 /// Payload: TaskSpawned
-/// Deterministic fields only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TaskSpawned {
     pub parent: u64,
@@ -118,7 +121,6 @@ impl EncodeLE for TaskSpawned {
     fn encoded_len(&self) -> usize {
         8 + 8
     }
-
     #[inline]
     fn encode_le(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.parent.to_le_bytes());
@@ -142,9 +144,6 @@ impl CapabilityKind {
 }
 
 /// Payload: CapabilityInvoked
-///
-/// `args_digest` is a fixed 32-byte digest of deterministic inputs (e.g., normalized path bytes).
-/// This avoids embedding variable-length strings in the binary log (good for speed + stability).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CapabilityInvoked {
     pub cap_kind: CapabilityKind,
@@ -157,7 +156,6 @@ impl EncodeLE for CapabilityInvoked {
     fn encoded_len(&self) -> usize {
         2 + 4 + 32
     }
-
     #[inline]
     fn encode_le(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.cap_kind.as_u16().to_le_bytes());
@@ -167,8 +165,6 @@ impl EncodeLE for CapabilityInvoked {
 }
 
 /// Payload: FuelExhausted
-///
-/// `budget_before` and `cost` are included so we can reconstruct policy behavior during replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FuelExhausted {
     pub budget_before: u64,
@@ -180,7 +176,6 @@ impl EncodeLE for FuelExhausted {
     fn encoded_len(&self) -> usize {
         8 + 8
     }
-
     #[inline]
     fn encode_le(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.budget_before.to_le_bytes());
@@ -189,9 +184,6 @@ impl EncodeLE for FuelExhausted {
 }
 
 /// Payload: ResourceViolation
-///
-/// Keep this compact. `violation_code` is a stable numeric policy ID.
-/// Optional detail is a fixed digest (e.g., capability/path digest, rule digest).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResourceViolation {
     pub violation_code: u32,
@@ -203,7 +195,6 @@ impl EncodeLE for ResourceViolation {
     fn encoded_len(&self) -> usize {
         4 + 32
     }
-
     #[inline]
     fn encode_le(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.violation_code.to_le_bytes());
@@ -212,12 +203,6 @@ impl EncodeLE for ResourceViolation {
 }
 
 /// Payload: RunFinished
-///
-/// IMPORTANT: In v0.5, we define `run_hash` as the SHA-256 over the event byte stream
-/// *up to but excluding* the RunFinished event. This allows stable comparison:
-/// `replay_hash == original_hash`.
-///
-/// The RunFinished event itself is still appended (I9), but it is not part of the hash it carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RunFinished {
     pub exit_code: i32,
@@ -229,10 +214,75 @@ impl EncodeLE for RunFinished {
     fn encoded_len(&self) -> usize {
         4 + 32
     }
-
     #[inline]
     fn encode_le(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.exit_code.to_le_bytes());
         dst.extend_from_slice(&self.run_hash_excluding_finish);
+    }
+}
+
+// ---------------- Path B: lifecycle payloads ----------------
+
+/// Payload: TaskStarted (empty payload; presence is the signal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskStarted;
+
+impl EncodeLE for TaskStarted {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        0
+    }
+    #[inline]
+    fn encode_le(&self, _dst: &mut Vec<u8>) {}
+}
+
+/// Payload: TaskFinished
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskFinished {
+    pub exit_code: i32,
+}
+
+impl EncodeLE for TaskFinished {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        4
+    }
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.exit_code.to_le_bytes());
+    }
+}
+
+/// Payload: TaskCancelled
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskCancelled {
+    pub reason_code: u32,
+}
+
+impl EncodeLE for TaskCancelled {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        4
+    }
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.reason_code.to_le_bytes());
+    }
+}
+
+/// Payload: TaskJoined
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskJoined {
+    pub joined_task: u64,
+}
+
+impl EncodeLE for TaskJoined {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8
+    }
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.joined_task.to_le_bytes());
     }
 }

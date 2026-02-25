@@ -19,6 +19,9 @@ impl std::fmt::Display for ParseError {
     }
 }
 
+// ✅ Required so `anyhow::Result` can use `?` on parser errors.
+impl std::error::Error for ParseError {}
+
 type PResult<T> = Result<T, ParseError>;
 
 pub struct Parser<'a> {
@@ -170,7 +173,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    // cap fs.read("..."); | cap net.listen(8080);
+    // cap fs.read("..."); | cap net.listen(8080); | cap net.listen(8000..9000);
     fn parse_cap_decl(&mut self) -> PResult<CapabilityDecl> {
         self.expect(Token::Cap)?;
 
@@ -189,10 +192,8 @@ impl<'a> Parser<'a> {
             ("net", "listen") => {
                 let (start, _) = self.expect_int()?;
 
-                // Check if it's a range: 8000..9000
                 let range = if self.consume(Token::Dot).is_some() {
                     self.expect(Token::Dot)?; // second dot
-
                     let (end, _) = self.expect_int()?;
                     NetPortSpec::Range(start, end)
                 } else {
@@ -201,17 +202,18 @@ impl<'a> Parser<'a> {
 
                 self.expect(Token::RParen)?;
                 self.expect(Token::Semi)?;
-
                 Capability::NetListen { range }
             }
             _ => {
-                return self
-                    .err_here("Unknown capability. Expected fs.read(...) or net.listen(...).")
+                return self.err_here(
+                    "Unknown capability. Expected fs.read(\"glob\") or net.listen(port|range).",
+                )
             }
         };
 
         Ok(CapabilityDecl { cap })
     }
+
     // neural name(params): type { format "..."; path "..."; }
     fn parse_neural_decl(&mut self) -> PResult<NeuralDecl> {
         self.expect(Token::Neural)?;
@@ -264,7 +266,6 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // ✅ Multi-effects
         let mut effects: Vec<Effect> = Vec::new();
         while self.consume(Token::Bang).is_some() {
             let (eff, sp) = self.expect_ident()?;
@@ -376,16 +377,20 @@ impl<'a> Parser<'a> {
 
     fn parse_return(&mut self) -> PResult<Stmt> {
         self.expect(Token::Return)?;
-        let e = self.parse_expr()?;
-        self.expect(Token::Semi)?;
-        Ok(Stmt::Return(Some(e)))
+        if self.at(Token::Semi) {
+            self.bump();
+            Ok(Stmt::Return(None))
+        } else {
+            let e = self.parse_expr()?;
+            self.expect(Token::Semi)?;
+            Ok(Stmt::Return(Some(e)))
+        }
     }
 
     fn parse_if_stmt(&mut self) -> PResult<Stmt> {
         self.expect(Token::If)?;
         let cond = self.parse_expr()?;
         let then_block = self.parse_block()?;
-
         let else_block = if self.consume(Token::Else).is_some() {
             Some(self.parse_block()?)
         } else {
@@ -631,5 +636,17 @@ impl<'a> Parser<'a> {
                 self.cur.kind
             )),
         }
+    }
+}
+
+/// ✅ Stable facade used by src/main.rs
+pub fn parse(src: &str) -> Result<Program, ParseError> {
+    let lexer = Lexer::new(src);
+    let mut p = Parser::new(lexer);
+    let (prog, errs) = p.parse_program_recovering();
+    if let Some(e) = errs.into_iter().next() {
+        Err(e)
+    } else {
+        Ok(prog)
     }
 }

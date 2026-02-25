@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Span {
     pub line: usize,

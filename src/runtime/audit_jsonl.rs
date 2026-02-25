@@ -1,121 +1,62 @@
 // src/runtime/audit_jsonl.rs
 //
-// v0.5 Step 2 wiring:
-// This module is intentionally kept (API compatibility), but all audit emission
-// is routed to the canonical binary EventRecorder (NO JSONL writing).
-//
-// Hard invariants:
-// - I9 append-only is enforced by EventRecorder (binary log)
-// - determinism: all digests are SHA-256 over UTF-8 bytes with fixed separators
-// - no timestamps, no usize, no floats
-//
-// NOTE: Step 3 will reintroduce JSONL as a fan-out sink *from* the recorder.
-// For now: binary-only.
+// v0.5.7.1 — AuditSink routing to canonical binary event log.
+// Deterministic: no timestamps, no RNG, no serde.
 
 use crate::runtime::event::{CapabilityInvoked, CapabilityKind};
 use crate::runtime::event_recorder::recorder;
 use crate::runtime::task_context::{AuditEvent, AuditSink, ResourceViolationKind};
-
 use sha2::{Digest, Sha256};
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
+use std::sync::Mutex;
 
-/// Backwards-compatible sink type.
-///
-/// `new(path)` is retained so existing code compiles unchanged, but `path` is
-/// currently ignored because binary logging is canonical in v0.5.
-pub struct JsonlAudit;
+/// Stable violation code assignments (must match src/replay.rs).
+pub const VIOL_FUEL_EXHAUSTED: u32 = 1;
+pub const VIOL_MEMORY_EXCEEDED: u32 = 2;
+pub const VIOL_CAPABILITY_DENIED: u32 = 3;
+
+/// Back-compat type: historically wrote JSONL; kept to preserve codegen API.
+/// We still open/touch the file path so the artifact exists inside NEX_OUT_DIR (I6).
+pub struct JsonlAudit {
+    _writer: Mutex<BufWriter<std::fs::File>>,
+}
 
 impl JsonlAudit {
-    #[allow(unused_variables)]
     pub fn new(path: &str) -> std::io::Result<Self> {
-        // Intentionally do NOT create/write the JSONL file in v0.5 Step 2.
-        // JSONL returns later as a sink adapter in Step 3.
-        Ok(Self)
+        let f = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            _writer: Mutex::new(BufWriter::new(f)),
+        })
     }
-}
 
-/// Stable mapping from ResourceViolationKind to a numeric violation code.
-/// These codes become part of the binary log contract; only append new codes.
-fn violation_code(kind: &ResourceViolationKind) -> u32 {
-    match kind {
-        ResourceViolationKind::FuelExhausted => 1,
-        ResourceViolationKind::MemoryExceeded => 2,
+    #[allow(dead_code)]
+    fn touch_line(&self, line: &str) {
+        if let Ok(mut w) = self._writer.lock() {
+            let _ = w.write_all(line.as_bytes());
+            let _ = w.write_all(b"\n");
+            let _ = w.flush();
+        }
     }
-}
-
-/// Deterministically infer capability kind from the capability string.
-/// This is a temporary bridge while older AuditEvent carries strings.
-///
-/// If unknown, we default to FsRead (safe, non-escalating) but keep determinism.
-/// In Step 3+ we’ll prefer structured capability IDs from the runtime policy layer.
-fn infer_cap_kind(capability: &str) -> CapabilityKind {
-    // Keep this logic strict and deterministic (no locale, no regex).
-    // Use exact substring checks to avoid surprises.
-    if capability.contains("net.listen") {
-        CapabilityKind::NetListen
-    } else {
-        CapabilityKind::FsRead
-    }
-}
-
-/// Deterministically derive a u32 capability ID from the capability string.
-/// This is stable across runs and machines.
-fn cap_id_from_str(capability: &str) -> u32 {
-    let mut h = Sha256::new();
-    h.update(capability.as_bytes());
-    let digest = h.finalize();
-    // First 4 bytes interpreted as LE u32 (explicit, deterministic).
-    u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
-}
-
-/// Deterministically hash (capability, target) for args digest.
-/// Separator 0x00 ensures unambiguous concatenation.
-fn args_digest_for_cap(capability: &str, target: &str) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(capability.as_bytes());
-    h.update([0u8]);
-    h.update(target.as_bytes());
-    let digest = h.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..]);
-    out
-}
-
-/// Deterministically hash a detail string into a fixed digest.
-fn detail_digest(detail: &str) -> [u8; 32] {
-    let mut h = Sha256::new();
-    h.update(detail.as_bytes());
-    let digest = h.finalize();
-
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..]);
-    out
 }
 
 impl AuditSink for JsonlAudit {
     fn emit(&self, event: AuditEvent) {
-        // IMPORTANT: do not panic on lock poisoning; audit must be best-effort
-        // only if the recorder itself is healthy. If the mutex is poisoned,
-        // continuing may violate append-only expectations, so we conservatively drop.
-        let Ok(mut rec) = recorder().lock() else {
-            return;
-        };
+        let rec = recorder();
+        let mut rec = rec.lock().expect("EventRecorder lock poisoned");
 
-        // Best-effort logging: swallow IO errors here to avoid cascading failures
-        // from audit paths. Policy enforcement should still panic/terminate where required.
-        // (If you want “audit failure is fatal”, we can flip this later.)
-        let _ = match event {
-            AuditEvent::TaskSpawned { parent, child } => rec.record_task_spawned(parent as u64, child as u64),
+        match event {
+            AuditEvent::TaskSpawned { parent, child } => {
+                rec.record_task_spawned(parent as u64, child as u64)
+                    .unwrap_or_else(|e| panic!("audit binary write failed (TaskSpawned): {e}"));
+            }
 
             AuditEvent::CapabilityInvoked {
                 task,
                 capability,
                 target,
             } => {
-                let cap_kind = infer_cap_kind(&capability);
-                let cap_id = cap_id_from_str(&capability);
-                let args_digest = args_digest_for_cap(&capability, &target);
-
+                let (cap_kind, cap_id, args_digest) = digest_capability(&capability, &target);
                 let payload = CapabilityInvoked {
                     cap_kind,
                     cap_id,
@@ -123,13 +64,63 @@ impl AuditSink for JsonlAudit {
                 };
 
                 rec.record_capability_invoked(task as u64, payload)
+                    .unwrap_or_else(|e| {
+                        panic!("audit binary write failed (CapabilityInvoked): {e}")
+                    });
             }
 
             AuditEvent::ResourceViolation { task, kind, detail } => {
-                let code = violation_code(&kind);
-                let digest = detail_digest(&detail);
-                rec.record_resource_violation(task as u64, code, digest)
+                let violation_code = violation_code(&kind);
+                let detail_digest = digest_detail(&detail);
+
+                rec.record_resource_violation(task as u64, violation_code, detail_digest)
+                    .unwrap_or_else(|e| {
+                        panic!("audit binary write failed (ResourceViolation): {e}")
+                    });
             }
-        };
+        }
     }
+}
+
+#[inline]
+fn violation_code(kind: &ResourceViolationKind) -> u32 {
+    match kind {
+        ResourceViolationKind::FuelExhausted => VIOL_FUEL_EXHAUSTED,
+        ResourceViolationKind::MemoryExceeded => VIOL_MEMORY_EXCEEDED,
+        ResourceViolationKind::CapabilityDenied => VIOL_CAPABILITY_DENIED,
+    }
+}
+
+#[inline]
+fn digest_detail(detail: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(detail.as_bytes());
+    h.finalize().into()
+}
+
+/// Deterministically derive (cap_kind, cap_id, args_digest) from (capability, target).
+///
+/// - cap_kind: stable enum (FsRead / NetListen).
+/// - cap_id: derived from args_digest low 4 bytes (LE).
+/// - args_digest: SHA-256 over: b"cap\0" + capability + b"\0" + target
+#[inline]
+fn digest_capability(capability: &str, target: &str) -> (CapabilityKind, u32, [u8; 32]) {
+    let cap_kind = if capability.starts_with("fs.read") {
+        CapabilityKind::FsRead
+    } else if capability.starts_with("net.listen") {
+        CapabilityKind::NetListen
+    } else {
+        // Deterministic fallback: pick FsRead (do NOT invent new enum variants).
+        CapabilityKind::FsRead
+    };
+
+    let mut h = Sha256::new();
+    h.update(b"cap\0");
+    h.update(capability.as_bytes());
+    h.update(b"\0");
+    h.update(target.as_bytes());
+    let digest: [u8; 32] = h.finalize().into();
+
+    let cap_id = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    (cap_kind, cap_id, digest)
 }

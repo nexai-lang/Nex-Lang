@@ -1,13 +1,10 @@
+// src/runtime/mod.rs
+pub mod audit_jsonl;
 pub mod event;
 pub mod event_recorder;
-pub mod audit_jsonl;
-pub mod task_context;
 pub mod event_sink;
 pub mod jsonl_sink;
+pub mod task_context;
 
-pub use audit_jsonl::JsonlAudit;
-
-pub use task_context::{
-    AuditEvent, AuditSink, CancelToken, Fuel, FuelError, TaskContext, TaskId, TaskRegistry,
-    FUEL_API_VERSION,
-};
+pub mod crc32;
+pub mod event_reader;

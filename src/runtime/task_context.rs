@@ -1,13 +1,4 @@
-//! v0.4.0 Phase 1 — Resource Governance Runtime Contract (thread runtime)
-//!
-//! Stable compiler↔runtime boundary:
-//!   - TaskContext::consume_fuel(cost)
-//!
-//! Thread-based semantics:
-//!   - Tasks are std::thread workers.
-//!   - Cancellation is cooperative via Arc<AtomicBool>.
-//!   - Fuel exhaustion cancels the entire subtree using BFS (non-recursive).
-//!   - Joining is performed by root/shutdown logic *outside* registry locks.
+// src/runtime/task_context.rs
 
 use std::collections::VecDeque;
 use std::sync::{
@@ -15,17 +6,16 @@ use std::sync::{
     Arc,
 };
 
-/// Stable identifier for tasks in the structured concurrency registry.
+use super::event_recorder;
+
 pub type TaskId = u64;
-
-/// Bump only when you intentionally break the compiler↔runtime fuel contract.
 pub const FUEL_API_VERSION: u32 = 1;
-
-/// Fuel costs are abstract "steps" (compiler-defined), not time.
 pub type Fuel = u64;
 
-/// v0.3.9-style cancellation token: Arc<AtomicBool>.
-/// Keep this simple and stable—this is part of the kernel ABI surface.
+// Stable reason codes for cancellation (deterministic)
+pub const CANCEL_REASON_BFS_SUBTREE: u32 = 1;
+pub const CANCEL_REASON_FUEL_EXHAUSTED: u32 = 2;
+
 #[derive(Clone)]
 pub struct CancelToken {
     flag: Arc<AtomicBool>,
@@ -55,8 +45,6 @@ impl CancelToken {
     }
 }
 
-/// Audit events are machine-readable (JSONL-friendly).
-/// Keep stable; replay/observability tooling will depend on this.
 #[derive(Debug, Clone)]
 pub enum AuditEvent {
     TaskSpawned {
@@ -79,27 +67,19 @@ pub enum AuditEvent {
 pub enum ResourceViolationKind {
     FuelExhausted,
     MemoryExceeded,
+    CapabilityDenied, // 🔐 NEW
 }
 
-/// Sink abstraction: could write JSONL lines, store in memory, forward to parent, etc.
 pub trait AuditSink: Send + Sync + 'static {
     fn emit(&self, event: AuditEvent);
 }
 
-/// Registry interface required for BFS cancellation.
-/// IMPORTANT: Joining must happen outside registry locks; this trait provides only snapshots/signals.
 pub trait TaskRegistry: Send + Sync + 'static {
-    /// Snapshot of direct children of `task`.
     fn children_of(&self, task: TaskId) -> Vec<TaskId>;
-
-    /// Mark cancelled in registry state (optional but useful).
     fn mark_cancelled(&self, task: TaskId);
-
-    /// Get the cancel token for a task.
     fn cancel_token_of(&self, task: TaskId) -> CancelToken;
 }
 
-/// Per-task resource governance context.
 pub struct TaskContext {
     fuel_api_version: u32,
     task_id: TaskId,
@@ -130,37 +110,87 @@ impl TaskContext {
         }
     }
 
-    #[inline]
-    pub fn task_id(&self) -> TaskId {
-        self.task_id
-    }
-
-    #[inline]
-    pub fn parent_id(&self) -> Option<TaskId> {
-        self.parent_id
-    }
-
-    #[inline]
+    // --- Accessors ---
     pub fn fuel_api_version(&self) -> u32 {
         self.fuel_api_version
     }
 
-    #[inline]
-    pub fn fuel_remaining(&self) -> Fuel {
-        self.fuel_remaining.load(Ordering::Relaxed)
+    pub fn task_id(&self) -> TaskId {
+        self.task_id
     }
 
-    #[inline]
+    pub fn parent_id(&self) -> Option<TaskId> {
+        self.parent_id
+    }
+
     pub fn cancel_token(&self) -> CancelToken {
         self.token.clone()
     }
 
-    /// Compiler-injected checkpoint.
-    ///
-    /// Semantics:
-    /// - If task already cancelled → Err(Cancelled) (fast path).
-    /// - Else atomically subtract cost from remaining fuel.
-    /// - If insufficient fuel → emit audit, BFS-cancel subtree, cancel self, Err(Exhausted).
+    // =========================
+    // Path B: Lifecycle Emission
+    // =========================
+    //
+    // These methods are deterministic and safe:
+    // - They emit to the canonical binary recorder IF it is initialized.
+    // - They do NOT panic if the recorder is not initialized.
+    // - They do NOT reorder events.
+    //
+    // Wiring into spawn/join runtime happens in Step 4 proper once we have those files.
+
+    pub fn emit_task_started(&self) {
+        if let Some(rec) = event_recorder::try_recorder() {
+            if let Ok(mut r) = rec.lock() {
+                let _ = r.record_task_started(self.task_id);
+            }
+        }
+    }
+
+    pub fn emit_task_finished(&self, exit_code: i32) {
+        if let Some(rec) = event_recorder::try_recorder() {
+            if let Ok(mut r) = rec.lock() {
+                let _ = r.record_task_finished(self.task_id, exit_code);
+            }
+        }
+    }
+
+    pub fn emit_task_cancelled(&self, reason_code: u32) {
+        if let Some(rec) = event_recorder::try_recorder() {
+            if let Ok(mut r) = rec.lock() {
+                let _ = r.record_task_cancelled(self.task_id, reason_code);
+            }
+        }
+    }
+
+    pub fn emit_task_joined(&self, joined_task: TaskId) {
+        if let Some(rec) = event_recorder::try_recorder() {
+            if let Ok(mut r) = rec.lock() {
+                let _ = r.record_task_joined(self.task_id, joined_task);
+            }
+        }
+    }
+
+    // 🔐 capability allowed (keeps your existing JSONL/audit pipeline)
+    pub fn emit_capability_allowed(&self, capability: &str, target: &str) {
+        self.audit.emit(AuditEvent::CapabilityInvoked {
+            task: self.task_id,
+            capability: capability.to_string(),
+            target: target.to_string(),
+        });
+    }
+
+    // 🔐 capability denied (keeps your existing JSONL/audit pipeline)
+    pub fn emit_capability_denied(&self, capability: &str, target: &str, reason: &str) {
+        self.audit.emit(AuditEvent::ResourceViolation {
+            task: self.task_id,
+            kind: ResourceViolationKind::CapabilityDenied,
+            detail: format!(
+                "Denied capability={} target={} reason={}",
+                capability, target, reason
+            ),
+        });
+    }
+
     pub fn consume_fuel(&self, cost: Fuel) -> Result<(), FuelError> {
         if self.token.is_cancelled() {
             return Err(FuelError::Cancelled);
@@ -194,7 +224,6 @@ impl TaskContext {
     }
 
     fn on_fuel_exhausted(&self, attempted_cost: Fuel, remaining: Fuel) {
-        // Audit best-effort (do not panic here).
         self.audit.emit(AuditEvent::ResourceViolation {
             task: self.task_id,
             kind: ResourceViolationKind::FuelExhausted,
@@ -204,26 +233,34 @@ impl TaskContext {
             ),
         });
 
-        // Cancel subtree iteratively (BFS).
-        self.cancel_subtree_bfs(self.task_id);
-
-        // Also cancel local token for fast exit on subsequent checkpoints.
+        // Deterministic subtree cancellation + lifecycle emission.
+        self.cancel_subtree_bfs_with_reason(self.task_id, CANCEL_REASON_FUEL_EXHAUSTED);
         self.token.cancel();
     }
 
-    /// BFS subtree cancellation to avoid recursion depth attacks.
-    ///
-    /// This only signals cancellation; join/shutdown logic must still join deterministically.
     pub fn cancel_subtree_bfs(&self, root: TaskId) {
+        self.cancel_subtree_bfs_with_reason(root, CANCEL_REASON_BFS_SUBTREE);
+    }
+
+    pub fn cancel_subtree_bfs_with_reason(&self, root: TaskId, reason_code: u32) {
         let mut q = VecDeque::new();
         q.push_back(root);
 
         while let Some(tid) = q.pop_front() {
             self.registry.mark_cancelled(tid);
 
+            // cancel token
             let tok = self.registry.cancel_token_of(tid);
             tok.cancel();
 
+            // emit lifecycle cancellation deterministically
+            if let Some(rec) = event_recorder::try_recorder() {
+                if let Ok(mut r) = rec.lock() {
+                    let _ = r.record_task_cancelled(tid, reason_code);
+                }
+            }
+
+            // BFS children
             let kids = self.registry.children_of(tid);
             for k in kids {
                 q.push_back(k);
