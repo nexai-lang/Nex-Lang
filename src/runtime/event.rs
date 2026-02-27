@@ -49,6 +49,8 @@ pub enum EventKind {
     IoDecision = 18,
     IoResult = 19,
     IoPayload = 20,
+    BusSend = 21,
+    BusRecv = 22,
 
     // ---- run framing ----
     RunStarted = 0xFFFE,
@@ -85,6 +87,8 @@ impl fmt::Display for EventKind {
             EventKind::IoDecision => "IoDecision",
             EventKind::IoResult => "IoResult",
             EventKind::IoPayload => "IoPayload",
+            EventKind::BusSend => "BusSend",
+            EventKind::BusRecv => "BusRecv",
         };
         f.write_str(s)
     }
@@ -633,5 +637,51 @@ impl EncodeLE for IoPayload {
             }
             None => dst.push(0),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusSend {
+    pub req_id: u64,
+    pub sender: u32,
+    pub receiver: u32,
+    pub kind: u16,
+    pub payload_len: u32,
+    pub payload_hash64: u64,
+}
+
+impl EncodeLE for BusSend {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 4 + 4 + 2 + 4 + 8
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.sender.to_le_bytes());
+        dst.extend_from_slice(&self.receiver.to_le_bytes());
+        dst.extend_from_slice(&self.kind.to_le_bytes());
+        dst.extend_from_slice(&self.payload_len.to_le_bytes());
+        dst.extend_from_slice(&self.payload_hash64.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusRecv {
+    pub req_id: u64,
+    pub receiver: u32,
+}
+
+impl EncodeLE for BusRecv {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 4
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.receiver.to_le_bytes());
     }
 }

@@ -199,6 +199,24 @@ fn json_line_for_record(header: &EventHeader, payload: &[u8]) -> io::Result<Stri
                 None => fields.push(r#""bytes_hex":null"#.to_string()),
             }
         }
+
+        EventKind::BusSend => {
+            let p = decode_bus_send(payload)?;
+            fields.push(r#""event":"BusSend""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""sender":{}"#, p.sender));
+            fields.push(format!(r#""receiver":{}"#, p.receiver));
+            fields.push(format!(r#""msg_kind":{}"#, p.kind));
+            fields.push(format!(r#""payload_len":{}"#, p.payload_len));
+            fields.push(format!(r#""payload_hash64":{}"#, p.payload_hash64));
+        }
+
+        EventKind::BusRecv => {
+            let p = decode_bus_recv(payload)?;
+            fields.push(r#""event":"BusRecv""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""receiver":{}"#, p.receiver));
+        }
     }
 
     Ok(format!("{{{}}}", fields.join(",")))
@@ -512,6 +530,26 @@ fn decode_io_payload(payload: &[u8]) -> io::Result<IoPayload> {
             format!("invalid IoPayload.has_bytes {}", v),
         )),
     }
+}
+
+fn decode_bus_send(payload: &[u8]) -> io::Result<BusSend> {
+    require_len(payload, 30, "BusSend")?;
+    Ok(BusSend {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        sender: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+        receiver: u32::from_le_bytes(payload[12..16].try_into().unwrap()),
+        kind: u16::from_le_bytes(payload[16..18].try_into().unwrap()),
+        payload_len: u32::from_le_bytes(payload[18..22].try_into().unwrap()),
+        payload_hash64: u64::from_le_bytes(payload[22..30].try_into().unwrap()),
+    })
+}
+
+fn decode_bus_recv(payload: &[u8]) -> io::Result<BusRecv> {
+    require_len(payload, 12, "BusRecv")?;
+    Ok(BusRecv {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        receiver: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+    })
 }
 
 fn escape_json(s: &str) -> String {

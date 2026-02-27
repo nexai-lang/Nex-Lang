@@ -104,7 +104,7 @@ fn generate_main(
     s.push_str("mod runtime;\n");
     s.push_str("use runtime::backend::{BackendKind, ExecBackend};\n");
     s.push_str("use runtime::event_recorder::{init_global_recorder_with_jsonl, recorder};\n\n");
-    s.push_str("use runtime::io_proxy::{DefaultIoProxy, IoError, IoProxy};\n\n");
+    s.push_str("use runtime::io_proxy::{DefaultIoProxy, IoError, IoProxy};\nuse runtime::agent_bus::{Mailbox, Message};\n\n");
 
     s.push_str("const CANCEL_REASON_BFS_SUBTREE: u32 = 1;\n");
     s.push_str(&format!(
@@ -153,6 +153,7 @@ fn generate_main(
         "    coop_jobs: Mutex<BTreeMap<u64, Box<dyn FnOnce(&Runtime, u64) -> i32 + Send + 'static>>>,\n",
     );
     s.push_str("    backend: Mutex<BackendKind>,\n");
+    s.push_str("    mailbox: Mutex<Mailbox>,\n");
     s.push_str("    io: Mutex<Box<dyn IoProxy + Send>>,\n");
     s.push_str("}\n\n");
 
@@ -167,6 +168,7 @@ fn generate_main(
     s.push_str("            next_task_id: AtomicU64::new(1),\n");
     s.push_str("            coop_jobs: Mutex::new(BTreeMap::new()),\n");
     s.push_str("            backend: Mutex::new(BackendKind::new()),\n");
+    s.push_str("            mailbox: Mutex::new(Mailbox::new()),\n");
     s.push_str("            io: Mutex::new(Box::new(DefaultIoProxy::new())),\n");
     s.push_str("        }\n");
     s.push_str("    }\n\n");
@@ -179,6 +181,47 @@ fn generate_main(
     s.push_str("    fn fs_write(&self, path: &str, data: &[u8]) -> Result<(), IoError> {\n");
     s.push_str("        let mut io = self.io.lock().unwrap();\n");
     s.push_str("        io.fs_write(path, data)\n");
+    s.push_str("    }\n\n");
+
+    s.push_str(
+        "    fn bus_send(&self, sender: u32, receiver: u32, seq: u64, kind: u16) -> u64 {\n",
+    );
+    s.push_str("        let req_id = {\n");
+    s.push_str("            let mut mailbox = self.mailbox.lock().unwrap();\n");
+    s.push_str("            mailbox.send(\n");
+    s.push_str("                sender,\n");
+    s.push_str("                receiver,\n");
+    s.push_str("                Message {\n");
+    s.push_str("                    req_id: 0,\n");
+    s.push_str("                    sender,\n");
+    s.push_str("                    seq,\n");
+    s.push_str("                    kind,\n");
+    s.push_str("                },\n");
+    s.push_str("            )\n");
+    s.push_str("        };\n");
+    s.push_str("\n");
+    s.push_str("        if let Ok(mut rec) = recorder().lock() {\n");
+    s.push_str(
+        "            let _ = rec.record_bus_send(0, req_id, sender, receiver, kind, 0, 0);\n",
+    );
+    s.push_str("        }\n");
+    s.push_str("\n");
+    s.push_str("        req_id\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn bus_recv(&self, receiver: u32) -> Option<Message> {\n");
+    s.push_str("        let msg = {\n");
+    s.push_str("            let mut mailbox = self.mailbox.lock().unwrap();\n");
+    s.push_str("            mailbox.recv(receiver)\n");
+    s.push_str("        };\n");
+    s.push_str("\n");
+    s.push_str("        if let Some(m) = msg.as_ref() {\n");
+    s.push_str("            if let Ok(mut rec) = recorder().lock() {\n");
+    s.push_str("                let _ = rec.record_bus_recv(0, m.req_id, receiver);\n");
+    s.push_str("            }\n");
+    s.push_str("        }\n");
+    s.push_str("\n");
+    s.push_str("        msg\n");
     s.push_str("    }\n\n");
 
     s.push_str("    fn backend_spawn(&self, parent: u64) -> u64 {\n");

@@ -15,9 +15,9 @@ use sha2::{Digest, Sha256};
 
 use super::crc32::crc32_ieee;
 use super::event::{
-    CapabilityInvoked, EncodeLE, EventHeader, EventKind, FuelDebit, FuelReason, IoDecision,
-    IoPayload, IoRequest, IoResult, PickTask, ResourceViolation, RunFinished, SchedInit,
-    SchedState, SchedStatePayload, TaskCancelled, TaskFinished, TaskJoined, TaskSpawned,
+    BusRecv, BusSend, CapabilityInvoked, EncodeLE, EventHeader, EventKind, FuelDebit, FuelReason,
+    IoDecision, IoPayload, IoRequest, IoResult, PickTask, ResourceViolation, RunFinished,
+    SchedInit, SchedState, SchedStatePayload, TaskCancelled, TaskFinished, TaskJoined, TaskSpawned,
     TaskStarted, TickEnd, TickStart, YieldKind, YieldPayload, EVENT_MAGIC, EVENT_VERSION,
 };
 use super::event_sink::EventSink;
@@ -317,6 +317,33 @@ impl EventRecorder {
         }
         .to_bytes_le();
         self.record_event(task, EventKind::IoPayload, &payload)
+    }
+
+    pub fn record_bus_send(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        sender: u32,
+        receiver: u32,
+        kind: u16,
+        payload_len: u32,
+        payload_hash64: u64,
+    ) -> io::Result<u64> {
+        let payload = BusSend {
+            req_id,
+            sender,
+            receiver,
+            kind,
+            payload_len,
+            payload_hash64,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::BusSend, &payload)
+    }
+
+    pub fn record_bus_recv(&mut self, task: u64, req_id: u64, receiver: u32) -> io::Result<u64> {
+        let payload = BusRecv { req_id, receiver }.to_bytes_le();
+        self.record_event(task, EventKind::BusRecv, &payload)
     }
 
     pub fn record_capability_invoked(

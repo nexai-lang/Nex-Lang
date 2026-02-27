@@ -55,6 +55,8 @@ pub const KIND_IO_REQUEST: u16 = 17;
 pub const KIND_IO_DECISION: u16 = 18;
 pub const KIND_IO_RESULT: u16 = 19;
 pub const KIND_IO_PAYLOAD: u16 = 20;
+pub const KIND_BUS_SEND: u16 = 21;
+pub const KIND_BUS_RECV: u16 = 22;
 
 // Reserved high kinds
 pub const KIND_RUN_STARTED: u16 = 0xFFFE;

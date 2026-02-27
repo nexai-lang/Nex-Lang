@@ -1,4 +1,4 @@
-// src/runtime/mod.rs
+pub mod agent_bus;
 pub mod audit_jsonl;
 pub mod backend;
 pub mod event;
