@@ -1,160 +1,651 @@
 // src/codegen.rs
-#![allow(dead_code, unused_mut, unused_variables)]
+//
+// Deterministic code generation for v0.5.x lifecycle verifier.
 
-use crate::ast::Program;
-use anyhow::Result;
-use std::path::Path;
+use crate::ast::*;
+use anyhow::{anyhow, Context, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub fn build_project(
-    _program: &Program,
+    program: &Program,
     build_dir: &Path,
-    runtime_out_dir: &Path,
+    out_dir: &Path,
     codegen_hash: [u8; 32],
     source_hash: [u8; 32],
 ) -> Result<()> {
     if build_dir.exists() {
-        std::fs::remove_dir_all(build_dir)?;
+        fs::remove_dir_all(build_dir)?;
     }
 
-    std::fs::create_dir_all(build_dir.join("src"))?;
-    std::fs::create_dir_all(runtime_out_dir)?;
+    fs::create_dir_all(build_dir.join("src"))?;
+    fs::create_dir_all(build_dir.join("src/runtime"))?;
 
-    let cargo_toml = r#"[package]
+    copy_runtime(build_dir)?;
+
+    let main_rs = generate_main(program, out_dir, codegen_hash, source_hash);
+    fs::write(build_dir.join("src/main.rs"), main_rs)?;
+
+    fs::write(
+        build_dir.join("Cargo.toml"),
+        r#"[package]
 name = "nex_out"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
 sha2 = "0.10"
-"#;
+hex = "0.4"
+"#,
+    )?;
 
-    std::fs::write(build_dir.join("Cargo.toml"), cargo_toml)?;
-    let runner = generate_rust(codegen_hash, source_hash);
-    std::fs::write(build_dir.join("src").join("main.rs"), runner)?;
-
-    let status = std::process::Command::new("cargo")
+    let output = Command::new("cargo")
         .arg("build")
-        .arg("--quiet")
+        .arg("--offline")
         .current_dir(build_dir)
-        .status()?;
+        .output()
+        .with_context(|| format!("Failed to run cargo build in {}", build_dir.display()))?;
 
-    if !status.success() {
-        anyhow::bail!("cargo build failed");
+    if !output.status.success() {
+        return Err(anyhow!(
+            "Generated crate build failed in {}\nstatus: {}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            build_dir.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     Ok(())
 }
 
-fn generate_rust(codegen_hash: [u8; 32], source_hash: [u8; 32]) -> String {
-    format!(
-        r#"
-use std::fs;
-use std::io::{{Write, BufWriter}};
-use std::sync::{{OnceLock, Mutex, atomic::{{AtomicU64, Ordering}}}};
-use sha2::{{Digest, Sha256}};
+fn copy_runtime(build_dir: &Path) -> Result<()> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let runtime_src = root.join("src/runtime");
 
-const LOG_MAGIC: [u8;4] = *b"NEXL";
-const LOG_VERSION: u16 = 1;
-const LOG_FLAGS: u16 = 0;
+    for entry in fs::read_dir(runtime_src)? {
+        let entry = entry?;
+        let p = entry.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("rs") {
+            let name = p
+                .file_name()
+                .ok_or_else(|| anyhow!("runtime source missing file name: {}", p.display()))?;
+            fs::copy(&p, build_dir.join("src/runtime").join(name))?;
+        }
+    }
 
-const KIND_TASK_STARTED: u16 = 5;
-const KIND_TASK_FINISHED: u16 = 6;
-const KIND_RUN_STARTED: u16 = 0xFFFE;
-const KIND_RUN_FINISHED: u16 = 0xFFFF;
+    Ok(())
+}
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-static HASHER: OnceLock<Mutex<Sha256>> = OnceLock::new();
+fn generate_main(
+    program: &Program,
+    out_dir: &Path,
+    codegen_hash: [u8; 32],
+    source_hash: [u8; 32],
+) -> String {
+    let mut s = String::new();
 
-fn hasher() -> &'static Mutex<Sha256> {{
-    HASHER.get_or_init(|| Mutex::new(Sha256::new()))
-}}
+    s.push_str("use std::collections::{BTreeMap, BTreeSet, VecDeque};\n");
+    s.push_str("use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};\n");
+    s.push_str("use std::sync::{Arc, Mutex};\n");
+    s.push_str("use std::thread::JoinHandle;\n\n");
 
-fn compute_crc32(bytes: &[u8]) -> u32 {{
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &b in bytes {{
-        crc ^= b as u32;
-        for _ in 0..8 {{
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB88320 & mask);
-        }}
-    }}
-    !crc
-}}
+    s.push_str("mod runtime;\n");
+    s.push_str("use runtime::event_recorder::{init_global_recorder_with_jsonl, recorder};\n\n");
 
-fn append_record(task_id: u64, kind: u16, payload: &[u8]) {{
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .open("./nex_out/events.bin")
-        .unwrap();
+    s.push_str("const CANCEL_REASON_BFS_SUBTREE: u32 = 1;\n\n");
 
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+    s.push_str("struct TaskEntry {\n");
+    s.push_str("    parent: Option<u64>,\n");
+    s.push_str("    children: BTreeSet<u64>,\n");
+    s.push_str("    cancel: Arc<AtomicBool>,\n");
+    s.push_str("    handle: Option<JoinHandle<i32>>,\n");
+    s.push_str("    started: bool,\n");
+    s.push_str("    finished: bool,\n");
+    s.push_str("    joined: bool,\n");
+    s.push_str("    cancelled_emitted: bool,\n");
+    s.push_str("}\n\n");
 
-    let mut rec = Vec::new();
-    rec.extend_from_slice(&seq.to_le_bytes());
-    rec.extend_from_slice(&task_id.to_le_bytes());
-    rec.extend_from_slice(&kind.to_le_bytes());
-    rec.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    rec.extend_from_slice(payload);
+    s.push_str("impl TaskEntry {\n");
+    s.push_str("    fn new(parent: Option<u64>, cancel: Arc<AtomicBool>) -> Self {\n");
+    s.push_str("        Self {\n");
+    s.push_str("            parent,\n");
+    s.push_str("            children: BTreeSet::new(),\n");
+    s.push_str("            cancel,\n");
+    s.push_str("            handle: None,\n");
+    s.push_str("            started: false,\n");
+    s.push_str("            finished: false,\n");
+    s.push_str("            joined: false,\n");
+    s.push_str("            cancelled_emitted: false,\n");
+    s.push_str("        }\n");
+    s.push_str("    }\n");
+    s.push_str("}\n\n");
 
-    if kind != KIND_RUN_FINISHED {{
-        hasher().lock().unwrap().update(&rec);
-    }}
+    s.push_str("struct Runtime {\n");
+    s.push_str("    tasks: Mutex<BTreeMap<u64, TaskEntry>>,\n");
+    s.push_str("    next_task_id: AtomicU64,\n");
+    s.push_str("}\n\n");
 
-    f.write_all(&rec).unwrap();
-}}
+    s.push_str("impl Runtime {\n");
+    s.push_str("    fn new() -> Self {\n");
+    s.push_str("        let mut tasks = BTreeMap::new();\n");
+    s.push_str(
+        "        tasks.insert(0, TaskEntry::new(None, Arc::new(AtomicBool::new(false))));\n",
+    );
+    s.push_str("        Self {\n");
+    s.push_str("            tasks: Mutex::new(tasks),\n");
+    s.push_str("            next_task_id: AtomicU64::new(1),\n");
+    s.push_str("        }\n");
+    s.push_str("    }\n\n");
 
-fn write_header() {{
-    fs::create_dir_all("./nex_out").unwrap();
-    let f = fs::File::create("./nex_out/events.bin").unwrap();
-    let mut bw = BufWriter::new(f);
+    s.push_str("    fn init_root(&self) {\n");
+    s.push_str("        {\n");
+    s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("            if let Some(root) = tasks.get_mut(&0) {\n");
+    s.push_str("                root.started = true;\n");
+    s.push_str("            }\n");
+    s.push_str("        }\n");
+    s.push_str("        self.record_task_started(0);\n");
+    s.push_str("    }\n\n");
 
-    let mut raw = Vec::new();
-    raw.extend_from_slice(&LOG_MAGIC);
-    raw.extend_from_slice(&LOG_VERSION.to_le_bytes());
-    raw.extend_from_slice(&{codegen_hash:?});
-    raw.extend_from_slice(&{source_hash:?});
-    raw.extend_from_slice(&LOG_FLAGS.to_le_bytes());
+    s.push_str("    fn finish_root(&self, exit_code: i32) {\n");
+    s.push_str("        {\n");
+    s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("            if let Some(root) = tasks.get_mut(&0) {\n");
+    s.push_str("                root.finished = true;\n");
+    s.push_str("            }\n");
+    s.push_str("        }\n");
+    s.push_str("        self.record_task_finished(0, exit_code);\n");
+    s.push_str("    }\n\n");
 
-    let crc = compute_crc32(&raw);
-    raw.extend_from_slice(&crc.to_le_bytes());
+    s.push_str("    fn record_task_spawned(&self, parent: u64, child: u64) {\n");
+    s.push_str("        let mut rec = recorder().lock().unwrap();\n");
+    s.push_str("        rec.record_task_spawned(parent, child).unwrap();\n");
+    s.push_str("    }\n\n");
 
-    bw.write_all(&raw).unwrap();
-    bw.flush().unwrap();
+    s.push_str("    fn record_task_started(&self, task: u64) {\n");
+    s.push_str("        let mut rec = recorder().lock().unwrap();\n");
+    s.push_str("        rec.record_task_started(task).unwrap();\n");
+    s.push_str("    }\n\n");
 
-    hasher().lock().unwrap().update(&raw);
-}}
+    s.push_str("    fn record_task_finished(&self, task: u64, exit: i32) {\n");
+    s.push_str("        let mut rec = recorder().lock().unwrap();\n");
+    s.push_str("        rec.record_task_finished(task, exit).unwrap();\n");
+    s.push_str("    }\n\n");
 
-fn run_finished(exit_code: i32) {{
-    let h = hasher().lock().unwrap().clone().finalize();
-    let mut arr = [0u8;32];
-    arr.copy_from_slice(&h[..]);
+    s.push_str("    fn record_task_cancelled(&self, task: u64, reason: u32) {\n");
+    s.push_str("        let mut rec = recorder().lock().unwrap();\n");
+    s.push_str("        rec.record_task_cancelled(task, reason).unwrap();\n");
+    s.push_str("    }\n\n");
 
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&exit_code.to_le_bytes());
-    payload.extend_from_slice(&arr);
+    s.push_str("    fn record_task_joined(&self, joiner: u64, joined: u64) {\n");
+    s.push_str("        let mut rec = recorder().lock().unwrap();\n");
+    s.push_str("        rec.record_task_joined(joiner, joined).unwrap();\n");
+    s.push_str("    }\n\n");
 
-    append_record(0, KIND_RUN_FINISHED, &payload);
-}}
+    s.push_str("    fn mark_task_finished(&self, task: u64) {\n");
+    s.push_str("        let mut tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("        if let Some(entry) = tasks.get_mut(&task) {\n");
+    s.push_str("            entry.finished = true;\n");
+    s.push_str("        }\n");
+    s.push_str("    }\n\n");
 
-fn main() {{
-    write_header();
-    append_record(0, KIND_RUN_STARTED, &[]);
+    s.push_str("    fn spawn_task<F>(rt: &Arc<Self>, parent: u64, f: F) -> u64\n");
+    s.push_str("    where\n");
+    s.push_str("        F: FnOnce(Arc<Self>, u64) -> i32 + Send + 'static,\n");
+    s.push_str("    {\n");
+    s.push_str("        let child = rt.next_task_id.fetch_add(1, Ordering::SeqCst);\n");
+    s.push_str("        let cancel = Arc::new(AtomicBool::new(false));\n\n");
 
-    append_record(0, KIND_TASK_STARTED, &[]);
+    s.push_str("        {\n");
+    s.push_str("            let mut tasks = rt.tasks.lock().unwrap();\n");
+    s.push_str(
+        "            tasks.insert(child, TaskEntry::new(Some(parent), Arc::clone(&cancel)));\n",
+    );
+    s.push_str("            if let Some(parent_entry) = tasks.get_mut(&parent) {\n");
+    s.push_str("                parent_entry.children.insert(child);\n");
+    s.push_str("            }\n");
+    s.push_str("        }\n\n");
 
-    let mut exit_code: i32 = 0;
+    s.push_str("        rt.record_task_spawned(parent, child);\n\n");
 
-    let r = std::panic::catch_unwind(|| {{
-    }});
+    s.push_str("        let (started_tx, started_rx) = std::sync::mpsc::channel();\n");
+    s.push_str("        let rt_child = Arc::clone(rt);\n");
+    s.push_str("        let handle = std::thread::spawn(move || {\n");
+    s.push_str("            rt_child.record_task_started(child);\n");
+    s.push_str("            {\n");
+    s.push_str("                let mut tasks = rt_child.tasks.lock().unwrap();\n");
+    s.push_str("                if let Some(entry) = tasks.get_mut(&child) {\n");
+    s.push_str("                    entry.started = true;\n");
+    s.push_str("                }\n");
+    s.push_str("            }\n");
+    s.push_str("            let _ = started_tx.send(());\n\n");
 
-    if r.is_err() {{
-        exit_code = 1;
-    }}
+    s.push_str(
+        "            let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
+    );
+    s.push_str("                f(Arc::clone(&rt_child), child)\n");
+    s.push_str("            }))\n");
+    s.push_str("            .unwrap_or(1);\n\n");
 
-    append_record(0, KIND_TASK_FINISHED, &exit_code.to_le_bytes());
+    s.push_str("            rt_child.mark_task_finished(child);\n");
+    s.push_str("            rt_child.record_task_finished(child, exit);\n");
+    s.push_str("            exit\n");
+    s.push_str("        });\n\n");
 
-    run_finished(exit_code);
-}}
-"#
-    )
+    s.push_str("        let _ = started_rx.recv();\n\n");
+
+    s.push_str("        {\n");
+    s.push_str("            let mut tasks = rt.tasks.lock().unwrap();\n");
+    s.push_str("            if let Some(entry) = tasks.get_mut(&child) {\n");
+    s.push_str("                entry.handle = Some(handle);\n");
+    s.push_str("            }\n");
+    s.push_str("        }\n\n");
+
+    s.push_str("        child\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn join_task(&self, joiner: u64, joined: u64) {\n");
+    s.push_str("        let handle = {\n");
+    s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("            let Some(entry) = tasks.get_mut(&joined) else {\n");
+    s.push_str("                return;\n");
+    s.push_str("            };\n");
+    s.push_str("            if entry.joined {\n");
+    s.push_str("                return;\n");
+    s.push_str("            }\n");
+    s.push_str("            entry.joined = true;\n");
+    s.push_str("            entry.handle.take()\n");
+    s.push_str("        };\n\n");
+
+    s.push_str("        if let Some(h) = handle {\n");
+    s.push_str("            let _ = h.join();\n");
+    s.push_str("        }\n\n");
+
+    s.push_str("        self.record_task_joined(joiner, joined);\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn cancel_subtree_bfs(&self, root: u64, reason: u32) {\n");
+    s.push_str("        let mut queue = VecDeque::new();\n");
+    s.push_str("        queue.push_back(root);\n\n");
+
+    s.push_str("        while let Some(task) = queue.pop_front() {\n");
+    s.push_str("            let (kids, emit_cancel) = {\n");
+    s.push_str("                let mut tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("                let Some(entry) = tasks.get_mut(&task) else {\n");
+    s.push_str("                    continue;\n");
+    s.push_str("                };\n");
+    s.push_str("                entry.cancel.store(true, Ordering::SeqCst);\n");
+    s.push_str("                let kids: Vec<u64> = entry.children.iter().copied().collect();\n");
+    s.push_str("                let emit = if entry.finished {\n");
+    s.push_str("                    false\n");
+    s.push_str("                } else if entry.cancelled_emitted {\n");
+    s.push_str("                    false\n");
+    s.push_str("                } else {\n");
+    s.push_str("                    entry.cancelled_emitted = true;\n");
+    s.push_str("                    true\n");
+    s.push_str("                };\n");
+    s.push_str("                (kids, emit)\n");
+    s.push_str("            };\n\n");
+
+    s.push_str("            if emit_cancel {\n");
+    s.push_str("                self.record_task_cancelled(task, reason);\n");
+    s.push_str("            }\n\n");
+
+    s.push_str("            for child in kids {\n");
+    s.push_str("                queue.push_back(child);\n");
+    s.push_str("            }\n");
+    s.push_str("        }\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn join_remaining_as_root(&self) {\n");
+    s.push_str("        let ids: Vec<u64> = {\n");
+    s.push_str("            let tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("            tasks\n");
+    s.push_str("                .iter()\n");
+    s.push_str("                .filter_map(|(&id, entry)| {\n");
+    s.push_str("                    if id == 0 || entry.joined {\n");
+    s.push_str("                        None\n");
+    s.push_str("                    } else {\n");
+    s.push_str("                        Some(id)\n");
+    s.push_str("                    }\n");
+    s.push_str("                })\n");
+    s.push_str("                .collect()\n");
+    s.push_str("        };\n\n");
+
+    s.push_str("        for id in ids {\n");
+    s.push_str("            self.join_task(0, id);\n");
+    s.push_str("        }\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn is_cancelled(&self, task: u64) -> bool {\n");
+    s.push_str("        let tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("        tasks\n");
+    s.push_str("            .get(&task)\n");
+    s.push_str("            .map(|entry| entry.cancel.load(Ordering::SeqCst))\n");
+    s.push_str("            .unwrap_or(false)\n");
+    s.push_str("    }\n");
+    s.push_str("}\n\n");
+
+    s.push_str("struct RootGuard {\n");
+    s.push_str("    rt: Arc<Runtime>,\n");
+    s.push_str("}\n\n");
+
+    s.push_str("impl RootGuard {\n");
+    s.push_str("    fn new(rt: Arc<Runtime>) -> Self {\n");
+    s.push_str("        Self { rt }\n");
+    s.push_str("    }\n");
+    s.push_str("}\n\n");
+
+    s.push_str("impl Drop for RootGuard {\n");
+    s.push_str("    fn drop(&mut self) {\n");
+    s.push_str("        self.rt.cancel_subtree_bfs(0, CANCEL_REASON_BFS_SUBTREE);\n");
+    s.push_str("        self.rt.join_remaining_as_root();\n");
+    s.push_str("    }\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn spawn_task<F>(rt: &Arc<Runtime>, parent: u64, f: F) -> u64\n");
+    s.push_str("where\n");
+    s.push_str("    F: FnOnce(Arc<Runtime>, u64) -> i32 + Send + 'static,\n");
+    s.push_str("{\n");
+    s.push_str("    Runtime::spawn_task(rt, parent, f)\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn join_task(rt: &Arc<Runtime>, joiner: u64, joined: u64) {\n");
+    s.push_str("    rt.join_task(joiner, joined);\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn cancel_task(rt: &Arc<Runtime>, root: u64) {\n");
+    s.push_str("    rt.cancel_subtree_bfs(root, CANCEL_REASON_BFS_SUBTREE);\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn cancelled(rt: &Arc<Runtime>, task: u64) -> bool {\n");
+    s.push_str("    rt.is_cancelled(task)\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn main() {\n");
+    s.push_str(&format!(
+        "    let out_dir = std::path::Path::new(r#\"{}\"#);\n",
+        out_dir.display()
+    ));
+    s.push_str("    std::fs::create_dir_all(out_dir).unwrap();\n");
+    s.push_str("    init_global_recorder_with_jsonl(out_dir, \"events.bin\", \"events.jsonl\").unwrap();\n");
+    s.push_str("    {\n");
+    s.push_str("        let mut r = recorder().lock().unwrap();\n");
+    s.push_str("        r.set_hashes(");
+    s.push_str(&format!("{:?}, {:?}", codegen_hash, source_hash));
+    s.push_str(");\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    let runtime = Arc::new(Runtime::new());\n");
+    s.push_str("    runtime.init_root();\n");
+    s.push_str("    let guard = RootGuard::new(Arc::clone(&runtime));\n\n");
+
+    s.push_str(
+        "    let exit_code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> i32 {\n",
+    );
+    if has_nex_main(program) {
+        s.push_str("        let _ = nex_main(&runtime, 0);\n");
+    }
+    s.push_str("        0\n");
+    s.push_str("    }))\n");
+    s.push_str("    .unwrap_or(1);\n\n");
+
+    s.push_str("    drop(guard);\n");
+    s.push_str("    runtime.finish_root(exit_code);\n");
+    s.push_str("    {\n");
+    s.push_str("        let mut r = recorder().lock().unwrap();\n");
+    s.push_str("        r.record_run_finished(0, exit_code).unwrap();\n");
+    s.push_str("    }\n");
+    s.push_str("}\n\n");
+
+    generate_functions(program, &mut s);
+
+    s
+}
+
+fn has_nex_main(program: &Program) -> bool {
+    program.items.iter().any(|item| match item {
+        Item::Function(f) => f.name == "main",
+        _ => false,
+    })
+}
+
+fn generate_functions(program: &Program, out: &mut String) {
+    for item in &program.items {
+        if let Item::Function(f) = item {
+            let name = mapped_func_name(&f.name);
+            out.push_str(&format!("fn {}(_rt: &Arc<Runtime>, _task_id: u64", name));
+            for p in &f.params {
+                out.push_str(&format!(", {}: i64", sanitize_ident(&p.name)));
+            }
+            out.push_str(") -> i32 {\n");
+            generate_block(&f.body, out, "_rt", "_task_id", 1);
+            out.push_str("    0\n");
+            out.push_str("}\n\n");
+        }
+    }
+}
+
+fn generate_block(block: &Block, out: &mut String, rt_var: &str, task_var: &str, indent: usize) {
+    for stmt in &block.stmts {
+        generate_stmt(stmt, out, rt_var, task_var, indent);
+    }
+}
+
+fn generate_stmt(stmt: &Stmt, out: &mut String, rt_var: &str, task_var: &str, indent: usize) {
+    let pad = "    ".repeat(indent);
+    match stmt {
+        Stmt::Let { name, value, .. } => {
+            out.push_str(&format!(
+                "{}let {} = {};\n",
+                pad,
+                sanitize_ident(name),
+                generate_expr(value, rt_var, task_var, indent)
+            ));
+        }
+        Stmt::Return(Some(e)) => {
+            out.push_str(&format!(
+                "{}return ({}) as i32;\n",
+                pad,
+                generate_expr(e, rt_var, task_var, indent)
+            ));
+        }
+        Stmt::Return(None) => {
+            out.push_str(&format!("{}return 0;\n", pad));
+        }
+        Stmt::Expr(e) => {
+            out.push_str(&format!(
+                "{}let _ = {};\n",
+                pad,
+                generate_expr(e, rt_var, task_var, indent)
+            ));
+        }
+        Stmt::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            out.push_str(&format!(
+                "{}if ({}) != 0 {{\n",
+                pad,
+                generate_expr(cond, rt_var, task_var, indent)
+            ));
+            generate_block(then_block, out, rt_var, task_var, indent + 1);
+            if let Some(eb) = else_block {
+                out.push_str(&format!("{}}} else {{\n", pad));
+                generate_block(eb, out, rt_var, task_var, indent + 1);
+            }
+            out.push_str(&format!("{}}}\n", pad));
+        }
+        Stmt::Loop(body) => {
+            out.push_str(&format!("{}loop {{\n", pad));
+            generate_block(body, out, rt_var, task_var, indent + 1);
+            out.push_str(&format!("{}}}\n", pad));
+        }
+        Stmt::Defer(body) => {
+            generate_block(body, out, rt_var, task_var, indent);
+        }
+    }
+}
+
+fn generate_expr(expr: &Expr, rt_var: &str, task_var: &str, indent: usize) -> String {
+    match expr {
+        Expr::Literal(Literal::Int(i)) => format!("{}i64", i),
+        Expr::Literal(Literal::Float(f)) => format!("{}f64 as i64", f),
+        Expr::Literal(Literal::Bool(b)) => {
+            if *b {
+                "1i64".to_string()
+            } else {
+                "0i64".to_string()
+            }
+        }
+        Expr::Literal(Literal::String(s)) => format!("(String::from({:?}).len() as i64)", s),
+        Expr::Variable(v) => sanitize_ident(v),
+
+        Expr::BinaryOp { left, op, right } => {
+            let l = generate_expr(left, rt_var, task_var, indent);
+            let r = generate_expr(right, rt_var, task_var, indent);
+            match op {
+                BinOp::Add => format!("(({}) + ({}))", l, r),
+                BinOp::Sub => format!("(({}) - ({}))", l, r),
+                BinOp::Mul => format!("(({}) * ({}))", l, r),
+                BinOp::Div => format!("(({}) / ({}))", l, r),
+                BinOp::Eq => format!("((( {}) == ( {} )) as i64)", l, r),
+                BinOp::Ne => format!("((( {}) != ( {} )) as i64)", l, r),
+                BinOp::Lt => format!("((( {}) < ( {} )) as i64)", l, r),
+                BinOp::Le => format!("((( {}) <= ( {} )) as i64)", l, r),
+                BinOp::Gt => format!("((( {}) > ( {} )) as i64)", l, r),
+                BinOp::Ge => format!("((( {}) >= ( {} )) as i64)", l, r),
+            }
+        }
+
+        Expr::Call { func, args, .. } => {
+            if func == "cancel" && args.len() == 1 {
+                let a0 = generate_expr(&args[0], rt_var, task_var, indent);
+                return format!("{{ cancel_task({}, ({}) as u64); 0i64 }}", rt_var, a0);
+            }
+
+            if func == "join" && args.len() == 1 {
+                let a0 = generate_expr(&args[0], rt_var, task_var, indent);
+                return format!(
+                    "{{ join_task({}, {}, ({}) as u64); 0i64 }}",
+                    rt_var, task_var, a0
+                );
+            }
+
+            if func == "cancelled" && args.is_empty() {
+                return format!("(cancelled({}, {}) as i64)", rt_var, task_var);
+            }
+
+            let mapped = mapped_func_name(func);
+            let mut rendered_args = Vec::new();
+            for a in args {
+                rendered_args.push(format!(
+                    "({}) as i64",
+                    generate_expr(a, rt_var, task_var, indent)
+                ));
+            }
+            if rendered_args.is_empty() {
+                format!("({}(&{}, {}) as i64)", mapped, rt_var, task_var)
+            } else {
+                format!(
+                    "({}(&{}, {}, {}) as i64)",
+                    mapped,
+                    rt_var,
+                    task_var,
+                    rendered_args.join(", ")
+                )
+            }
+        }
+
+        Expr::Spawn { block, .. } => {
+            let mut body = String::new();
+            let pad = "    ".repeat(indent + 2);
+            for st in &block.stmts {
+                let mut local = String::new();
+                generate_stmt(st, &mut local, "_rt_child", "_task_child", indent + 2);
+                body.push_str(&local);
+            }
+            if body.is_empty() {
+                body.push_str(&format!("{}let _ = 0;\n", pad));
+            }
+
+            format!(
+                "{{ let __rt_spawn = Arc::clone({}); spawn_task(&__rt_spawn, {}, move |_rt_child: Arc<Runtime>, _task_child: u64| -> i32 {{ {}{}0 }}) }}",
+                rt_var,
+                task_var,
+                body,
+                "    ".repeat(indent + 2)
+            )
+        }
+
+        Expr::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            let c = generate_expr(cond, rt_var, task_var, indent);
+            let t = block_expr(then_block, rt_var, task_var, indent);
+            let e = else_block
+                .as_ref()
+                .map(|b| block_expr(b, rt_var, task_var, indent))
+                .unwrap_or_else(|| "0i64".to_string());
+            format!("(if ({}) != 0 {{ {} }} else {{ {} }})", c, t, e)
+        }
+
+        Expr::Block(b) => block_expr(b, rt_var, task_var, indent),
+    }
+}
+
+fn block_expr(block: &Block, rt_var: &str, task_var: &str, indent: usize) -> String {
+    let mut s = String::new();
+    s.push_str("{ ");
+    for st in &block.stmts {
+        match st {
+            Stmt::Expr(e) => {
+                s.push_str(&format!(
+                    "let _ = {}; ",
+                    generate_expr(e, rt_var, task_var, indent + 1)
+                ));
+            }
+            Stmt::Let { name, value, .. } => {
+                s.push_str(&format!(
+                    "let {} = {}; ",
+                    sanitize_ident(name),
+                    generate_expr(value, rt_var, task_var, indent + 1)
+                ));
+            }
+            _ => {
+                s.push_str("let _ = 0; ");
+            }
+        }
+    }
+    s.push_str("0i64 }");
+    s
+}
+
+fn mapped_func_name(name: &str) -> String {
+    if name == "main" {
+        "nex_main".to_string()
+    } else {
+        sanitize_ident(name)
+    }
+}
+
+fn sanitize_ident(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "_".to_string()
+    } else {
+        out
+    }
 }

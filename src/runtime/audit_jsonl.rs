@@ -24,7 +24,11 @@ pub struct JsonlAudit {
 
 impl JsonlAudit {
     pub fn new(path: &str) -> std::io::Result<Self> {
-        let f = OpenOptions::new().create(true).append(true).open(path)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(path)?;
         Ok(Self {
             _writer: Mutex::new(BufWriter::new(f)),
         })

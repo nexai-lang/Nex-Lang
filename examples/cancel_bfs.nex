@@ -1,0 +1,19 @@
+// examples/cancel_bfs.nex
+// Phase 1 Structural Verifier test (lifecycle closure)
+
+fn worker() {
+  // minimal body
+  1 + 2;
+}
+
+fn main() {
+  let t1 = spawn { worker(); };
+  let t2 = spawn { worker(); };
+
+  // cancel root subtree (root id = 0) using builtin helper
+  cancel(0);
+
+  // join via builtin helper
+  join(t1);
+  join(t2);
+}

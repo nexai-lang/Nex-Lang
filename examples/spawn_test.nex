@@ -1,0 +1,4 @@
+fn main() {
+    let t = spawn { 1 + 2; };
+    join(t);
+}
