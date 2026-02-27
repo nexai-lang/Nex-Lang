@@ -15,12 +15,13 @@ use sha2::{Digest, Sha256};
 
 use super::crc32::crc32_ieee;
 use super::event::{
-    CapabilityInvoked, EncodeLE, EventHeader, EventKind, FuelDebit, FuelReason, PickTask,
-    ResourceViolation, RunFinished, SchedInit, SchedState, SchedStatePayload, TaskCancelled,
-    TaskFinished, TaskJoined, TaskSpawned, TaskStarted, TickEnd, TickStart, YieldKind,
-    YieldPayload, EVENT_MAGIC, EVENT_VERSION,
+    CapabilityInvoked, EncodeLE, EventHeader, EventKind, FuelDebit, FuelReason, IoDecision,
+    IoPayload, IoRequest, IoResult, PickTask, ResourceViolation, RunFinished, SchedInit,
+    SchedState, SchedStatePayload, TaskCancelled, TaskFinished, TaskJoined, TaskSpawned,
+    TaskStarted, TickEnd, TickStart, YieldKind, YieldPayload, EVENT_MAGIC, EVENT_VERSION,
 };
 use super::event_sink::EventSink;
+use super::io_proxy::IoKind;
 use super::jsonl_sink::JsonlSink;
 
 const LOG_HEADER_LEN: usize = 76;
@@ -281,6 +282,41 @@ impl EventRecorder {
         }
         .to_bytes_le();
         self.record_event(task, EventKind::FuelDebit, &payload)
+    }
+
+    pub fn record_io_request(&mut self, task: u64, kind: IoKind, path: &str) -> io::Result<u64> {
+        let payload = IoRequest {
+            kind,
+            path: path.to_string(),
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::IoRequest, &payload)
+    }
+
+    pub fn record_io_decision(&mut self, task: u64, allowed: bool) -> io::Result<u64> {
+        let payload = IoDecision { allowed }.to_bytes_le();
+        self.record_event(task, EventKind::IoDecision, &payload)
+    }
+
+    pub fn record_io_result(&mut self, task: u64, success: bool, size: u64) -> io::Result<u64> {
+        let payload = IoResult { success, size }.to_bytes_le();
+        self.record_event(task, EventKind::IoResult, &payload)
+    }
+
+    pub fn record_io_payload(
+        &mut self,
+        task: u64,
+        hash64: u64,
+        size: u64,
+        bytes: Option<&[u8]>,
+    ) -> io::Result<u64> {
+        let payload = IoPayload {
+            hash64,
+            size,
+            bytes: bytes.map(|b| b.to_vec()),
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::IoPayload, &payload)
     }
 
     pub fn record_capability_invoked(

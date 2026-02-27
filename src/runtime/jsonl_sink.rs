@@ -5,6 +5,7 @@
 
 use crate::runtime::event::*;
 use crate::runtime::event_sink::EventSink;
+use crate::runtime::io_proxy::IoKind;
 use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
@@ -158,6 +159,45 @@ fn json_line_for_record(header: &EventHeader, payload: &[u8]) -> io::Result<Stri
             fields.push(format!(r#""task_id":{}"#, p.task_id));
             fields.push(format!(r#""amount":{}"#, p.amount));
             fields.push(format!(r#""reason_code":{}"#, p.reason.as_u8()));
+        }
+
+        EventKind::IoRequest => {
+            let p = decode_io_request(payload)?;
+            fields.push(r#""event":"IoRequest""#.to_string());
+            fields.push(format!(r#""io_kind":{}"#, p.kind.as_u8()));
+            fields.push(format!(r#""path":"{}""#, escape_json(&p.path)));
+        }
+
+        EventKind::IoDecision => {
+            let p = decode_io_decision(payload)?;
+            fields.push(r#""event":"IoDecision""#.to_string());
+            fields.push(format!(
+                r#""allowed":{}"#,
+                if p.allowed { "true" } else { "false" }
+            ));
+        }
+
+        EventKind::IoResult => {
+            let p = decode_io_result(payload)?;
+            fields.push(r#""event":"IoResult""#.to_string());
+            fields.push(format!(
+                r#""success":{}"#,
+                if p.success { "true" } else { "false" }
+            ));
+            fields.push(format!(r#""size":{}"#, p.size));
+        }
+
+        EventKind::IoPayload => {
+            let p = decode_io_payload(payload)?;
+            fields.push(r#""event":"IoPayload""#.to_string());
+            fields.push(format!(r#""hash64":{}"#, p.hash64));
+            fields.push(format!(r#""size":{}"#, p.size));
+            match p.bytes {
+                Some(bytes) => {
+                    fields.push(format!(r#""bytes_hex":"{}""#, hex::encode(bytes)));
+                }
+                None => fields.push(r#""bytes_hex":null"#.to_string()),
+            }
         }
     }
 
@@ -351,6 +391,127 @@ fn decode_fuel_debit(payload: &[u8]) -> io::Result<FuelDebit> {
         amount: u32::from_le_bytes(payload[12..16].try_into().unwrap()),
         reason,
     })
+}
+
+fn decode_io_request(payload: &[u8]) -> io::Result<IoRequest> {
+    if payload.len() < 3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("IoRequest payload too short: {}", payload.len()),
+        ));
+    }
+
+    let kind = IoKind::from_u8(payload[0]).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid IoRequest.kind {}", payload[0]),
+        )
+    })?;
+    let path_len = u16::from_le_bytes(payload[1..3].try_into().unwrap()) as usize;
+    if payload.len() != 3 + path_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "IoRequest payload length mismatch: expected {}, got {}",
+                3 + path_len,
+                payload.len()
+            ),
+        ));
+    }
+
+    let path = std::str::from_utf8(&payload[3..])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("IoRequest.path: {}", e)))?
+        .to_string();
+
+    Ok(IoRequest { kind, path })
+}
+
+fn decode_io_decision(payload: &[u8]) -> io::Result<IoDecision> {
+    require_len(payload, 1, "IoDecision")?;
+    match payload[0] {
+        0 => Ok(IoDecision { allowed: false }),
+        1 => Ok(IoDecision { allowed: true }),
+        v => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid IoDecision.allowed {}", v),
+        )),
+    }
+}
+
+fn decode_io_result(payload: &[u8]) -> io::Result<IoResult> {
+    require_len(payload, 9, "IoResult")?;
+    let success = match payload[0] {
+        0 => false,
+        1 => true,
+        v => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid IoResult.success {}", v),
+            ));
+        }
+    };
+    Ok(IoResult {
+        success,
+        size: u64::from_le_bytes(payload[1..9].try_into().unwrap()),
+    })
+}
+
+fn decode_io_payload(payload: &[u8]) -> io::Result<IoPayload> {
+    if payload.len() < 17 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("IoPayload payload too short: {}", payload.len()),
+        ));
+    }
+    let hash64 = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let size = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let has_bytes = payload[16];
+    match has_bytes {
+        0 => {
+            if payload.len() != 17 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "IoPayload payload length mismatch: expected 17, got {}",
+                        payload.len()
+                    ),
+                ));
+            }
+            Ok(IoPayload {
+                hash64,
+                size,
+                bytes: None,
+            })
+        }
+        1 => {
+            if payload.len() < 21 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("IoPayload bytes payload too short: {}", payload.len()),
+                ));
+            }
+            let len = u32::from_le_bytes(payload[17..21].try_into().unwrap()) as usize;
+            if payload.len() != 21 + len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "IoPayload bytes length mismatch: expected {}, got {}",
+                        21 + len,
+                        payload.len()
+                    ),
+                ));
+            }
+            Ok(IoPayload {
+                hash64,
+                size,
+                bytes: Some(payload[21..].to_vec()),
+            })
+        }
+        v => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid IoPayload.has_bytes {}", v),
+        )),
+    }
 }
 
 fn escape_json(s: &str) -> String {

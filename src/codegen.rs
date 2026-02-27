@@ -104,6 +104,7 @@ fn generate_main(
     s.push_str("mod runtime;\n");
     s.push_str("use runtime::backend::{BackendKind, ExecBackend};\n");
     s.push_str("use runtime::event_recorder::{init_global_recorder_with_jsonl, recorder};\n\n");
+    s.push_str("use runtime::io_proxy::{DefaultIoProxy, IoError, IoProxy};\n\n");
 
     s.push_str("const CANCEL_REASON_BFS_SUBTREE: u32 = 1;\n");
     s.push_str(&format!(
@@ -152,6 +153,7 @@ fn generate_main(
         "    coop_jobs: Mutex<BTreeMap<u64, Box<dyn FnOnce(&Runtime, u64) -> i32 + Send + 'static>>>,\n",
     );
     s.push_str("    backend: Mutex<BackendKind>,\n");
+    s.push_str("    io: Mutex<Box<dyn IoProxy + Send>>,\n");
     s.push_str("}\n\n");
 
     s.push_str("impl Runtime {\n");
@@ -165,7 +167,18 @@ fn generate_main(
     s.push_str("            next_task_id: AtomicU64::new(1),\n");
     s.push_str("            coop_jobs: Mutex::new(BTreeMap::new()),\n");
     s.push_str("            backend: Mutex::new(BackendKind::new()),\n");
+    s.push_str("            io: Mutex::new(Box::new(DefaultIoProxy::new())),\n");
     s.push_str("        }\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn fs_read(&self, path: &str) -> Result<Vec<u8>, IoError> {\n");
+    s.push_str("        let mut io = self.io.lock().unwrap();\n");
+    s.push_str("        io.fs_read(path)\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn fs_write(&self, path: &str, data: &[u8]) -> Result<(), IoError> {\n");
+    s.push_str("        let mut io = self.io.lock().unwrap();\n");
+    s.push_str("        io.fs_write(path, data)\n");
     s.push_str("    }\n\n");
 
     s.push_str("    fn backend_spawn(&self, parent: u64) -> u64 {\n");

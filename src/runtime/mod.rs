@@ -4,6 +4,7 @@ pub mod backend;
 pub mod event;
 pub mod event_recorder;
 pub mod event_sink;
+pub mod io_proxy;
 pub mod jsonl_sink;
 pub mod scheduler;
 pub mod task_context;

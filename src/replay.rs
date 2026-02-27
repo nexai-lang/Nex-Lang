@@ -5,10 +5,11 @@
 
 use crate::runtime::event::{SchedState, YieldKind};
 use crate::runtime::event_reader::{
-    EventReader, KIND_CAPABILITY_INVOKED, KIND_FUEL_DEBIT, KIND_PICK_TASK, KIND_RESOURCE_VIOLATION,
-    KIND_RUN_FINISHED, KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_CANCELLED, KIND_TASK_FINISHED,
-    KIND_TASK_JOINED, KIND_TASK_SPAWNED, KIND_TASK_STARTED, KIND_TICK_END, KIND_TICK_START,
-    KIND_YIELD, RECORD_HEADER_LEN,
+    EventReader, KIND_CAPABILITY_INVOKED, KIND_FUEL_DEBIT, KIND_IO_DECISION, KIND_IO_PAYLOAD,
+    KIND_IO_REQUEST, KIND_IO_RESULT, KIND_PICK_TASK, KIND_RESOURCE_VIOLATION, KIND_RUN_FINISHED,
+    KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_CANCELLED, KIND_TASK_FINISHED, KIND_TASK_JOINED,
+    KIND_TASK_SPAWNED, KIND_TASK_STARTED, KIND_TICK_END, KIND_TICK_START, KIND_YIELD,
+    RECORD_HEADER_LEN,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,12 @@ use std::io::{self, BufReader};
 use std::path::Path;
 
 pub const VIOL_CAPABILITY_DENIED: u32 = 3;
+const LOG_FLAG_REPLAY_MODE: u16 = 0x0001;
+const IO_KIND_FS_READ: u8 = 1;
+const IO_KIND_FS_WRITE: u8 = 2;
+const IO_KIND_NET_CONNECT: u8 = 3;
+const IO_KIND_NET_SEND: u8 = 4;
+const IO_KIND_NET_RECV: u8 = 5;
 
 #[derive(Debug, Default)]
 struct TaskState {
@@ -24,6 +31,25 @@ struct TaskState {
     started: bool,
     finished: bool,
     cancelled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingIoState {
+    AwaitDecision {
+        request_seq: u64,
+        kind: u8,
+    },
+    AwaitPayload {
+        request_seq: u64,
+        kind: u8,
+        allowed: bool,
+    },
+    AwaitResult {
+        request_seq: u64,
+        kind: u8,
+        allowed: bool,
+        payload_size: Option<u64>,
+    },
 }
 
 #[derive(Debug)]
@@ -152,6 +178,131 @@ fn decode_fuel_debit_tick(payload: &[u8]) -> io::Result<u64> {
     Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
 }
 
+fn decode_io_request(payload: &[u8]) -> io::Result<u8> {
+    if payload.len() < 3 {
+        return Err(err_invalid(format!(
+            "Bad IoRequest payload len {}",
+            payload.len()
+        )));
+    }
+    let path_len = u16::from_le_bytes(payload[1..3].try_into().unwrap()) as usize;
+    if payload.len() != 3 + path_len {
+        return Err(err_invalid(format!(
+            "Bad IoRequest payload length mismatch: expected {}, got {}",
+            3 + path_len,
+            payload.len()
+        )));
+    }
+    match payload[0] {
+        IO_KIND_FS_READ | IO_KIND_FS_WRITE | IO_KIND_NET_CONNECT | IO_KIND_NET_SEND
+        | IO_KIND_NET_RECV => Ok(payload[0]),
+        v => Err(err_invalid(format!("invalid IoRequest kind {}", v))),
+    }
+}
+
+fn decode_io_decision(payload: &[u8]) -> io::Result<bool> {
+    if payload.len() != 1 {
+        return Err(err_invalid(format!(
+            "Bad IoDecision payload len {}",
+            payload.len()
+        )));
+    }
+    match payload[0] {
+        0 => Ok(false),
+        1 => Ok(true),
+        v => Err(err_invalid(format!("invalid IoDecision.allowed {}", v))),
+    }
+}
+
+fn decode_io_result(payload: &[u8]) -> io::Result<(bool, u64)> {
+    if payload.len() != 9 {
+        return Err(err_invalid(format!(
+            "Bad IoResult payload len {}",
+            payload.len()
+        )));
+    }
+    let success = match payload[0] {
+        0 => false,
+        1 => true,
+        v => return Err(err_invalid(format!("invalid IoResult.success {}", v))),
+    };
+    let size = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+    match payload[0] {
+        0 | 1 => Ok((success, size)),
+        v => Err(err_invalid(format!("invalid IoResult.success {}", v))),
+    }
+}
+
+fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, Option<&[u8]>)> {
+    if payload.len() < 17 {
+        return Err(err_invalid(format!(
+            "Bad IoPayload payload len {}",
+            payload.len()
+        )));
+    }
+
+    let hash64 = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let size = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let has_bytes = payload[16];
+    match has_bytes {
+        0 => {
+            if payload.len() != 17 {
+                return Err(err_invalid(format!(
+                    "Bad IoPayload payload length mismatch: expected 17, got {}",
+                    payload.len()
+                )));
+            }
+            Ok((hash64, size, None))
+        }
+        1 => {
+            if payload.len() < 21 {
+                return Err(err_invalid(format!(
+                    "Bad IoPayload payload too short for bytes len: {}",
+                    payload.len()
+                )));
+            }
+            let len = u32::from_le_bytes(payload[17..21].try_into().unwrap()) as usize;
+            if payload.len() != 21 + len {
+                return Err(err_invalid(format!(
+                    "Bad IoPayload payload length mismatch: expected {}, got {}",
+                    21 + len,
+                    payload.len()
+                )));
+            }
+            Ok((hash64, size, Some(&payload[21..])))
+        }
+        v => Err(err_invalid(format!("invalid IoPayload.has_bytes {}", v))),
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn io_kind_name(kind: u8) -> &'static str {
+    match kind {
+        IO_KIND_FS_READ => "fs.read",
+        IO_KIND_FS_WRITE => "fs.write",
+        IO_KIND_NET_CONNECT => "net.connect",
+        IO_KIND_NET_SEND => "net.send",
+        IO_KIND_NET_RECV => "net.recv",
+        _ => "io.unknown",
+    }
+}
+
+#[inline]
+fn is_io_event_kind(kind: u16) -> bool {
+    matches!(
+        kind,
+        KIND_IO_REQUEST | KIND_IO_DECISION | KIND_IO_PAYLOAD | KIND_IO_RESULT
+    )
+}
+
 fn is_allowed_sched_transition(from: SchedState, to: SchedState) -> bool {
     matches!(
         (from, to),
@@ -196,6 +347,10 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
     let mut fuel_exhausted_seen = false;
     let mut saw_draining_state = false;
     let mut saw_finished_state = false;
+    let replay_mode = (header.flags & LOG_FLAG_REPLAY_MODE) != 0;
+    let mut pending_io: Vec<(u64, u8)> = Vec::new();
+    let mut pending_io_state: Option<PendingIoState> = None;
+    let mut last_io_seq: Option<u64> = None;
 
     while let Some(ev) = reader.read_next()? {
         if seen_run_finished {
@@ -206,6 +361,47 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
         }
 
         events_seen = events_seen.saturating_add(1);
+
+        if is_io_event_kind(ev.kind) {
+            if let Some(last) = last_io_seq {
+                if ev.seq <= last {
+                    return Err(err_invalid(format!(
+                        "I/O event sequence is not strictly increasing: prev={} current={} kind={}",
+                        last, ev.seq, ev.kind
+                    )));
+                }
+            }
+            last_io_seq = Some(ev.seq);
+        }
+
+        if let Some(pending) = pending_io_state {
+            match pending {
+                PendingIoState::AwaitDecision { .. } => {
+                    if ev.kind != KIND_IO_DECISION {
+                        return Err(err_invalid(format!(
+                            "IoDecision expected after IoRequest but found kind {} at seq={}",
+                            ev.kind, ev.seq
+                        )));
+                    }
+                }
+                PendingIoState::AwaitPayload { .. } => {
+                    if ev.kind != KIND_IO_PAYLOAD {
+                        return Err(err_invalid(format!(
+                            "IoPayload expected after allowed IoDecision but found kind {} at seq={}",
+                            ev.kind, ev.seq
+                        )));
+                    }
+                }
+                PendingIoState::AwaitResult { .. } => {
+                    if ev.kind != KIND_IO_RESULT {
+                        return Err(err_invalid(format!(
+                            "IoResult expected after IoDecision/IoPayload but found kind {} at seq={}",
+                            ev.kind, ev.seq
+                        )));
+                    }
+                }
+            }
+        }
 
         if ev.kind == KIND_CAPABILITY_INVOKED {
             cap_allowed_total = cap_allowed_total.saturating_add(1);
@@ -568,6 +764,278 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                 }
             }
 
+            KIND_IO_REQUEST => {
+                let kind = decode_io_request(&ev.payload)?;
+                if replay_mode {
+                    return Err(err_invalid(format!(
+                        "IoRequest not allowed in replay mode at seq={}",
+                        ev.seq
+                    )));
+                }
+                if !pending_io.is_empty() || pending_io_state.is_some() {
+                    return Err(err_invalid(format!(
+                        "IoRequest started before previous IO operation completed at seq={}",
+                        ev.seq
+                    )));
+                }
+                pending_io.push((ev.seq, kind));
+                pending_io_state = Some(PendingIoState::AwaitDecision {
+                    request_seq: ev.seq,
+                    kind,
+                });
+            }
+
+            KIND_IO_DECISION => {
+                let allowed = decode_io_decision(&ev.payload)?;
+                match pending_io_state {
+                    Some(PendingIoState::AwaitDecision { request_seq, kind }) => {
+                        if allowed {
+                            pending_io_state = Some(PendingIoState::AwaitPayload {
+                                request_seq,
+                                kind,
+                                allowed,
+                            });
+                        } else {
+                            pending_io_state = Some(PendingIoState::AwaitResult {
+                                request_seq,
+                                kind,
+                                allowed,
+                                payload_size: None,
+                            });
+                        }
+                    }
+                    Some(PendingIoState::AwaitPayload { .. }) => {
+                        return Err(err_invalid(format!(
+                            "duplicate IoDecision before IoPayload at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    Some(PendingIoState::AwaitResult { .. }) => {
+                        return Err(err_invalid(format!(
+                            "duplicate IoDecision before IoResult at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    None => {
+                        return Err(err_invalid(format!(
+                            "IoDecision without preceding IoRequest at seq={}",
+                            ev.seq
+                        )));
+                    }
+                }
+            }
+
+            KIND_IO_PAYLOAD => {
+                let (hash64, size, bytes) = decode_io_payload(&ev.payload)?;
+                match pending_io_state {
+                    Some(PendingIoState::AwaitPayload {
+                        request_seq,
+                        kind,
+                        allowed,
+                    }) => {
+                        if !allowed {
+                            return Err(err_invalid(format!(
+                                "IoPayload after denied IoDecision at seq={}",
+                                ev.seq
+                            )));
+                        }
+                        match kind {
+                            IO_KIND_FS_READ | IO_KIND_NET_RECV => {
+                                if let Some(inline) = bytes {
+                                    if (inline.len() as u64) != size {
+                                        return Err(err_invalid(format!(
+                                            "IoPayload size mismatch for {} at seq={}: payload.size={} inline_len={}",
+                                            io_kind_name(kind),
+                                            ev.seq,
+                                            size,
+                                            inline.len()
+                                        )));
+                                    }
+                                    let computed = fnv1a64(inline);
+                                    if computed != hash64 {
+                                        return Err(err_invalid(format!(
+                                            "IoPayload hash mismatch for {} at seq={}: expected={} computed={}",
+                                            io_kind_name(kind),
+                                            ev.seq,
+                                            hash64,
+                                            computed
+                                        )));
+                                    }
+                                } else if size <= 64 * 1024 {
+                                    return Err(err_invalid(format!(
+                                        "IoPayload missing inline bytes for {} size {} at seq={}",
+                                        io_kind_name(kind),
+                                        size,
+                                        ev.seq
+                                    )));
+                                }
+                            }
+                            IO_KIND_FS_WRITE => {
+                                if bytes.is_some() {
+                                    return Err(err_invalid(format!(
+                                        "IoPayload.bytes must be absent for {} at seq={}",
+                                        io_kind_name(kind),
+                                        ev.seq
+                                    )));
+                                }
+                            }
+                            IO_KIND_NET_SEND => {
+                                if let Some(inline) = bytes {
+                                    if (inline.len() as u64) != size {
+                                        return Err(err_invalid(format!(
+                                            "IoPayload size mismatch for net.send at seq={}: payload.size={} inline_len={}",
+                                            ev.seq, size, inline.len()
+                                        )));
+                                    }
+                                    let computed = fnv1a64(inline);
+                                    if computed != hash64 {
+                                        return Err(err_invalid(format!(
+                                            "IoPayload hash mismatch for net.send at seq={}: expected={} computed={}",
+                                            ev.seq, hash64, computed
+                                        )));
+                                    }
+                                }
+                            }
+                            IO_KIND_NET_CONNECT => {
+                                let inline = bytes.ok_or_else(|| {
+                                    err_invalid(format!(
+                                        "IoPayload missing inline bytes for net.connect at seq={}",
+                                        ev.seq
+                                    ))
+                                })?;
+                                if size != 8 {
+                                    return Err(err_invalid(format!(
+                                        "IoPayload size mismatch for net.connect at seq={}: expected 8, got {}",
+                                        ev.seq, size
+                                    )));
+                                }
+                                if inline.len() != 8 {
+                                    return Err(err_invalid(format!(
+                                        "IoPayload inline bytes length mismatch for net.connect at seq={}: expected 8, got {}",
+                                        ev.seq,
+                                        inline.len()
+                                    )));
+                                }
+                                let computed = fnv1a64(inline);
+                                if computed != hash64 {
+                                    return Err(err_invalid(format!(
+                                        "IoPayload hash mismatch for net.connect at seq={}: expected={} computed={}",
+                                        ev.seq, hash64, computed
+                                    )));
+                                }
+                            }
+                            _ => {
+                                return Err(err_invalid(format!(
+                                    "invalid pending IoRequest kind {} at seq={}",
+                                    kind, ev.seq
+                                )));
+                            }
+                        }
+                        pending_io_state = Some(PendingIoState::AwaitResult {
+                            request_seq,
+                            kind,
+                            allowed,
+                            payload_size: Some(size),
+                        });
+                    }
+                    Some(PendingIoState::AwaitDecision { .. }) => {
+                        return Err(err_invalid(format!(
+                            "IoPayload before IoDecision at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    Some(PendingIoState::AwaitResult { .. }) => {
+                        return Err(err_invalid(format!(
+                            "duplicate IoPayload before IoResult at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    None => {
+                        return Err(err_invalid(format!(
+                            "IoPayload without preceding IoRequest at seq={}",
+                            ev.seq
+                        )));
+                    }
+                }
+            }
+
+            KIND_IO_RESULT => {
+                let (success, size) = decode_io_result(&ev.payload)?;
+                match pending_io_state {
+                    Some(PendingIoState::AwaitResult {
+                        request_seq,
+                        kind,
+                        allowed,
+                        payload_size,
+                    }) => {
+                        if allowed && payload_size.is_none() {
+                            return Err(err_invalid(format!(
+                                "IoResult without IoPayload after allowed IoDecision at seq={}",
+                                ev.seq
+                            )));
+                        }
+                        if !allowed && success {
+                            return Err(err_invalid(format!(
+                                "IoResult.success=true after denied IoDecision at seq={}",
+                                ev.seq
+                            )));
+                        }
+                        if let Some(ps) = payload_size {
+                            if size != ps {
+                                return Err(err_invalid(format!(
+                                    "IoResult.size mismatch with IoPayload at seq={}: payload_size={} result_size={}",
+                                    ev.seq, ps, size
+                                )));
+                            }
+                        }
+                        if allowed
+                            && (kind == IO_KIND_FS_READ || kind == IO_KIND_NET_RECV)
+                            && !success
+                        {
+                            if size != 0 {
+                                return Err(err_invalid(format!(
+                                    "failed {} IoResult must have size=0 at seq={}: got {}",
+                                    io_kind_name(kind),
+                                    ev.seq,
+                                    size
+                                )));
+                            }
+                        }
+                        let (req_seq, req_kind) = pending_io.pop().ok_or_else(|| {
+                            err_invalid(format!(
+                                "IoResult without matching IoRequest at seq={}",
+                                ev.seq
+                            ))
+                        })?;
+                        if req_seq != request_seq || req_kind != kind {
+                            return Err(err_invalid(format!(
+                                "IoResult matched wrong IoRequest at seq={}: request_seq={} result_request_seq={} request_kind={} result_kind={}",
+                                ev.seq, req_seq, request_seq, req_kind, kind
+                            )));
+                        }
+                        pending_io_state = None;
+                    }
+                    Some(PendingIoState::AwaitDecision { .. }) => {
+                        return Err(err_invalid(format!(
+                            "IoResult before IoDecision at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    Some(PendingIoState::AwaitPayload { .. }) => {
+                        return Err(err_invalid(format!(
+                            "IoResult before IoPayload at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    None => {
+                        return Err(err_invalid(format!(
+                            "IoResult without matching IoRequest at seq={}",
+                            ev.seq
+                        )));
+                    }
+                }
+            }
+
             _ => {}
         }
 
@@ -609,6 +1077,12 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
 
     if !seen_run_finished {
         return Err(err_invalid("missing RunFinished record"));
+    }
+
+    if pending_io_state.is_some() || !pending_io.is_empty() {
+        return Err(err_invalid(
+            "log ended with incomplete IO operation (missing IoDecision, IoPayload, or IoResult)",
+        ));
     }
 
     if scheduler_events_seen {
@@ -691,8 +1165,9 @@ mod tests {
     use super::*;
     use crate::runtime::crc32::crc32_ieee;
     use crate::runtime::event_reader::{
-        KIND_RUN_FINISHED, KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_FINISHED,
-        KIND_TASK_STARTED, KIND_TICK_END, KIND_TICK_START, LOG_HEADER_LEN, LOG_MAGIC, LOG_VERSION,
+        KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT, KIND_RUN_FINISHED,
+        KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_FINISHED, KIND_TASK_STARTED, KIND_TICK_END,
+        KIND_TICK_START, LOG_HEADER_LEN, LOG_MAGIC, LOG_VERSION,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -850,6 +1325,227 @@ mod tests {
         );
     }
 
+    #[test]
+    fn negative_io_missing_decision_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(2, 0, KIND_IO_RESULT, &io_result_payload(true, 12)),
+            record(3, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 4);
+        let path = write_temp_log("neg_io_missing_decision", &bytes);
+
+        let err = verify_log(&path).expect_err("expected missing IoDecision failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoDecision expected after IoRequest"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn negative_io_result_without_request_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(1, 0, KIND_IO_RESULT, &io_result_payload(true, 12)),
+            record(2, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 3);
+        let path = write_temp_log("neg_io_result_without_request", &bytes);
+
+        let err = verify_log(&path).expect_err("expected IoResult-without-IoRequest failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoResult without matching IoRequest"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn negative_io_decision_without_request_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(1, 0, KIND_IO_DECISION, &io_decision_payload(true)),
+            record(2, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 3);
+        let path = write_temp_log("neg_io_decision_without_request", &bytes);
+
+        let err = verify_log(&path).expect_err("expected IoDecision-without-IoRequest failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoDecision without preceding IoRequest"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn negative_io_denied_but_success_result_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(2, 0, KIND_IO_DECISION, &io_decision_payload(false)),
+            record(3, 0, KIND_IO_RESULT, &io_result_payload(true, 12)),
+            record(4, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 5);
+        let path = write_temp_log("neg_io_denied_success", &bytes);
+
+        let err = verify_log(&path).expect_err("expected denied/success mismatch failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoResult.success=true after denied IoDecision"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn negative_io_two_results_for_one_request_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(2, 0, KIND_IO_DECISION, &io_decision_payload(false)),
+            record(3, 0, KIND_IO_RESULT, &io_result_payload(false, 0)),
+            record(4, 0, KIND_IO_RESULT, &io_result_payload(false, 0)),
+            record(5, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 6);
+        let path = write_temp_log("neg_io_two_results", &bytes);
+
+        let err = verify_log(&path).expect_err("expected duplicate IoResult failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoResult without matching IoRequest"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn negative_replay_mode_io_request_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(2, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log_with_flags(records, 0, 3, super::LOG_FLAG_REPLAY_MODE);
+        let path = write_temp_log("neg_replay_mode_io_request", &bytes);
+
+        let err = verify_log(&path).expect_err("expected replay-mode IoRequest rejection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoRequest not allowed in replay mode"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn v06_logs_without_io_events_still_pass() {
+        let records = base_records();
+        let bytes = finalize_log(records, 0, 2);
+        let path = write_temp_log("v06_no_io_ok", &bytes);
+        verify_log(&path).expect("v0.6 style logs without I/O should remain valid");
+    }
+
+    #[test]
+    fn negative_io_allowed_missing_payload_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(2, 0, KIND_IO_DECISION, &io_decision_payload(true)),
+            record(3, 0, KIND_IO_RESULT, &io_result_payload(true, 12)),
+            record(4, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 5);
+        let path = write_temp_log("neg_io_missing_payload", &bytes);
+
+        let err = verify_log(&path).expect_err("expected missing IoPayload failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoPayload expected after allowed IoDecision"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn negative_io_payload_hash_mismatch_rejected() {
+        let inline = b"hello-payload".to_vec();
+        let bad_hash = super::fnv1a64(&inline).wrapping_add(1);
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(2, 0, KIND_IO_DECISION, &io_decision_payload(true)),
+            record(
+                3,
+                0,
+                KIND_IO_PAYLOAD,
+                &io_payload_payload(bad_hash, inline.len() as u64, Some(&inline)),
+            ),
+            record(
+                4,
+                0,
+                KIND_IO_RESULT,
+                &io_result_payload(true, inline.len() as u64),
+            ),
+            record(5, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 6);
+        let path = write_temp_log("neg_io_payload_hash", &bytes);
+
+        let err = verify_log(&path).expect_err("expected payload hash mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoPayload hash mismatch"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
     fn base_records() -> Vec<Vec<u8>> {
         vec![
             record(0, 0, KIND_TASK_STARTED, &[]),
@@ -857,20 +1553,29 @@ mod tests {
         ]
     }
 
-    fn build_header() -> [u8; LOG_HEADER_LEN] {
+    fn build_header_with_flags(flags: u16) -> [u8; LOG_HEADER_LEN] {
         let mut h = [0u8; LOG_HEADER_LEN];
         h[0..4].copy_from_slice(&LOG_MAGIC);
         h[4..6].copy_from_slice(&LOG_VERSION.to_le_bytes());
         h[6..38].copy_from_slice(&[0x11u8; 32]);
         h[38..70].copy_from_slice(&[0x22u8; 32]);
-        h[70..72].copy_from_slice(&0u16.to_le_bytes());
+        h[70..72].copy_from_slice(&flags.to_le_bytes());
         let crc = crc32_ieee(&h[0..72]);
         h[72..76].copy_from_slice(&crc.to_le_bytes());
         h
     }
 
-    fn finalize_log(mut records: Vec<Vec<u8>>, exit_code: i32, run_finished_seq: u64) -> Vec<u8> {
-        let header = build_header();
+    fn build_header() -> [u8; LOG_HEADER_LEN] {
+        build_header_with_flags(0)
+    }
+
+    fn finalize_log_with_flags(
+        mut records: Vec<Vec<u8>>,
+        exit_code: i32,
+        run_finished_seq: u64,
+        flags: u16,
+    ) -> Vec<u8> {
+        let header = build_header_with_flags(flags);
 
         let mut hasher = Sha256::new();
         hasher.update(header);
@@ -890,6 +1595,10 @@ mod tests {
             out.extend_from_slice(&rec);
         }
         out
+    }
+
+    fn finalize_log(records: Vec<Vec<u8>>, exit_code: i32, run_finished_seq: u64) -> Vec<u8> {
+        finalize_log_with_flags(records, exit_code, run_finished_seq, 0)
     }
 
     fn record(seq: u64, task_id: u64, kind: u16, payload: &[u8]) -> Vec<u8> {
@@ -933,6 +1642,41 @@ mod tests {
         p.extend_from_slice(&task_id.to_le_bytes());
         p.extend_from_slice(&(rb.len() as u16).to_le_bytes());
         p.extend_from_slice(rb);
+        p
+    }
+
+    fn io_request_payload(kind: u8, path: &str) -> Vec<u8> {
+        let path_bytes = path.as_bytes();
+        let mut p = Vec::with_capacity(3 + path_bytes.len());
+        p.push(kind);
+        p.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        p.extend_from_slice(path_bytes);
+        p
+    }
+
+    fn io_decision_payload(allowed: bool) -> Vec<u8> {
+        vec![if allowed { 1 } else { 0 }]
+    }
+
+    fn io_result_payload(success: bool, size: u64) -> Vec<u8> {
+        let mut p = Vec::with_capacity(9);
+        p.push(if success { 1 } else { 0 });
+        p.extend_from_slice(&size.to_le_bytes());
+        p
+    }
+
+    fn io_payload_payload(hash64: u64, size: u64, bytes: Option<&[u8]>) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&hash64.to_le_bytes());
+        p.extend_from_slice(&size.to_le_bytes());
+        match bytes {
+            Some(b) => {
+                p.push(1);
+                p.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                p.extend_from_slice(b);
+            }
+            None => p.push(0),
+        }
         p
     }
 

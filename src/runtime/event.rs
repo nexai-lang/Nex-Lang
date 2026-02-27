@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+use crate::runtime::io_proxy::IoKind;
 use core::fmt;
 
 /// Binary log file magic (4 bytes).
@@ -44,6 +45,10 @@ pub enum EventKind {
     PickTask = 14,
     r#Yield = 15,
     FuelDebit = 16,
+    IoRequest = 17,
+    IoDecision = 18,
+    IoResult = 19,
+    IoPayload = 20,
 
     // ---- run framing ----
     RunStarted = 0xFFFE,
@@ -76,6 +81,10 @@ impl fmt::Display for EventKind {
             EventKind::PickTask => "PickTask",
             EventKind::r#Yield => "Yield",
             EventKind::FuelDebit => "FuelDebit",
+            EventKind::IoRequest => "IoRequest",
+            EventKind::IoDecision => "IoDecision",
+            EventKind::IoResult => "IoResult",
+            EventKind::IoPayload => "IoPayload",
         };
         f.write_str(s)
     }
@@ -529,5 +538,100 @@ impl EncodeLE for FuelDebit {
         dst.extend_from_slice(&self.task_id.to_le_bytes());
         dst.extend_from_slice(&self.amount.to_le_bytes());
         dst.push(self.reason.as_u8());
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IoRequest {
+    pub kind: IoKind,
+    pub path: String,
+}
+
+impl EncodeLE for IoRequest {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        let bytes = self.path.as_bytes();
+        1 + 2 + bytes.len().min(u16::MAX as usize)
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        let path_bytes = self.path.as_bytes();
+        let path_len = path_bytes.len().min(u16::MAX as usize) as u16;
+        dst.push(self.kind.as_u8());
+        dst.extend_from_slice(&path_len.to_le_bytes());
+        dst.extend_from_slice(&path_bytes[..path_len as usize]);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoDecision {
+    pub allowed: bool,
+}
+
+impl EncodeLE for IoDecision {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        1
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.push(if self.allowed { 1 } else { 0 });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoResult {
+    pub success: bool,
+    pub size: u64,
+}
+
+impl EncodeLE for IoResult {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        1 + 8
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.push(if self.success { 1 } else { 0 });
+        dst.extend_from_slice(&self.size.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IoPayload {
+    pub hash64: u64,
+    pub size: u64,
+    pub bytes: Option<Vec<u8>>,
+}
+
+impl EncodeLE for IoPayload {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        let bytes_len = self.bytes.as_ref().map(|v| v.len()).unwrap_or(0);
+        8 + 8
+            + 1
+            + if self.bytes.is_some() {
+                4 + bytes_len
+            } else {
+                0
+            }
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.hash64.to_le_bytes());
+        dst.extend_from_slice(&self.size.to_le_bytes());
+        match &self.bytes {
+            Some(bytes) => {
+                let len_u32 = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+                dst.push(1);
+                dst.extend_from_slice(&len_u32.to_le_bytes());
+                dst.extend_from_slice(&bytes[..len_u32 as usize]);
+            }
+            None => dst.push(0),
+        }
     }
 }

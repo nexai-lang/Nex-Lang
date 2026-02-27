@@ -51,6 +51,10 @@ pub const KIND_TICK_END: u16 = 13;
 pub const KIND_PICK_TASK: u16 = 14;
 pub const KIND_YIELD: u16 = 15;
 pub const KIND_FUEL_DEBIT: u16 = 16;
+pub const KIND_IO_REQUEST: u16 = 17;
+pub const KIND_IO_DECISION: u16 = 18;
+pub const KIND_IO_RESULT: u16 = 19;
+pub const KIND_IO_PAYLOAD: u16 = 20;
 
 // Reserved high kinds
 pub const KIND_RUN_STARTED: u16 = 0xFFFE;
