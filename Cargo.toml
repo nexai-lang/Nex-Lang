@@ -3,6 +3,9 @@ name = "nex"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+coop_scheduler = []
+
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
 anyhow = "1.0"

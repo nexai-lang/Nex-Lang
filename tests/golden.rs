@@ -1,3 +1,4 @@
+#![cfg(not(feature = "coop_scheduler"))]
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::fs;

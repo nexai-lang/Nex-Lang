@@ -34,15 +34,22 @@ name = "nex_out"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+coop_scheduler = []
+
 [dependencies]
 sha2 = "0.10"
 hex = "0.4"
 "#,
     )?;
 
-    let output = Command::new("cargo")
-        .arg("build")
-        .arg("--offline")
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build").arg("--offline");
+    if cfg!(feature = "coop_scheduler") {
+        cmd.arg("--features").arg("coop_scheduler");
+    }
+
+    let output = cmd
         .current_dir(build_dir)
         .output()
         .with_context(|| format!("Failed to run cargo build in {}", build_dir.display()))?;
@@ -89,18 +96,32 @@ fn generate_main(
     s.push_str("use std::collections::{BTreeMap, BTreeSet, VecDeque};\n");
     s.push_str("use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};\n");
     s.push_str("use std::sync::{Arc, Mutex};\n");
-    s.push_str("use std::thread::JoinHandle;\n\n");
+    if !cfg!(feature = "coop_scheduler") {
+        s.push_str("use std::thread::JoinHandle;\n");
+    }
+    s.push_str("\n");
 
     s.push_str("mod runtime;\n");
+    s.push_str("use runtime::backend::{BackendKind, ExecBackend};\n");
     s.push_str("use runtime::event_recorder::{init_global_recorder_with_jsonl, recorder};\n\n");
 
-    s.push_str("const CANCEL_REASON_BFS_SUBTREE: u32 = 1;\n\n");
+    s.push_str("const CANCEL_REASON_BFS_SUBTREE: u32 = 1;\n");
+    s.push_str(&format!(
+        "const COOP_MODE: bool = {};\n\n",
+        if cfg!(feature = "coop_scheduler") {
+            "true"
+        } else {
+            "false"
+        }
+    ));
 
     s.push_str("struct TaskEntry {\n");
     s.push_str("    parent: Option<u64>,\n");
     s.push_str("    children: BTreeSet<u64>,\n");
     s.push_str("    cancel: Arc<AtomicBool>,\n");
-    s.push_str("    handle: Option<JoinHandle<i32>>,\n");
+    if !cfg!(feature = "coop_scheduler") {
+        s.push_str("    handle: Option<JoinHandle<i32>>,\n");
+    }
     s.push_str("    started: bool,\n");
     s.push_str("    finished: bool,\n");
     s.push_str("    joined: bool,\n");
@@ -113,7 +134,9 @@ fn generate_main(
     s.push_str("            parent,\n");
     s.push_str("            children: BTreeSet::new(),\n");
     s.push_str("            cancel,\n");
-    s.push_str("            handle: None,\n");
+    if !cfg!(feature = "coop_scheduler") {
+        s.push_str("            handle: None,\n");
+    }
     s.push_str("            started: false,\n");
     s.push_str("            finished: false,\n");
     s.push_str("            joined: false,\n");
@@ -125,6 +148,10 @@ fn generate_main(
     s.push_str("struct Runtime {\n");
     s.push_str("    tasks: Mutex<BTreeMap<u64, TaskEntry>>,\n");
     s.push_str("    next_task_id: AtomicU64,\n");
+    s.push_str(
+        "    coop_jobs: Mutex<BTreeMap<u64, Box<dyn FnOnce(&Runtime, u64) -> i32 + Send + 'static>>>,\n",
+    );
+    s.push_str("    backend: Mutex<BackendKind>,\n");
     s.push_str("}\n\n");
 
     s.push_str("impl Runtime {\n");
@@ -136,6 +163,61 @@ fn generate_main(
     s.push_str("        Self {\n");
     s.push_str("            tasks: Mutex::new(tasks),\n");
     s.push_str("            next_task_id: AtomicU64::new(1),\n");
+    s.push_str("            coop_jobs: Mutex::new(BTreeMap::new()),\n");
+    s.push_str("            backend: Mutex::new(BackendKind::new()),\n");
+    s.push_str("        }\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn backend_spawn(&self, parent: u64) -> u64 {\n");
+    s.push_str("        let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("        backend.spawn(parent)\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn backend_request_join(&self, waiter: u64, target: u64) {\n");
+    s.push_str("        let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("        backend.request_join(waiter, target);\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn backend_cancel_bfs(&self, root: u64) -> Vec<u64> {\n");
+    s.push_str("        let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("        backend.cancel_bfs(root)\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn backend_forced_exit_code(&self) -> Option<i32> {\n");
+    s.push_str("        let backend = self.backend.lock().unwrap();\n");
+    s.push_str("        backend.forced_exit_code()\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn backend_tick_or_step(&self) {\n");
+    s.push_str("        if COOP_MODE {\n");
+    s.push_str("            let mut spins: u64 = 0;\n");
+    s.push_str("            loop {\n");
+    s.push_str("                let picked = {\n");
+    s.push_str("                    let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("                    backend.run();\n");
+    s.push_str("                    backend.take_picked()\n");
+    s.push_str("                };\n\n");
+    s.push_str("                if let Some(task) = picked {\n");
+    s.push_str("                    let exit = self.execute_one_coop_task(task);\n");
+    s.push_str("                    let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("                    backend.complete(task, exit);\n");
+    s.push_str("                } else {\n");
+    s.push_str("                    let done = {\n");
+    s.push_str("                        let backend = self.backend.lock().unwrap();\n");
+    s.push_str("                        backend.is_finished()\n");
+    s.push_str("                    };\n");
+    s.push_str("                    if done {\n");
+    s.push_str("                        break;\n");
+    s.push_str("                    }\n");
+    s.push_str("                }\n\n");
+    s.push_str("                spins = spins.saturating_add(1);\n");
+    s.push_str("                if spins > 1_000_000 {\n");
+    s.push_str("                    break;\n");
+    s.push_str("                }\n");
+    s.push_str("            }\n");
+    s.push_str("        } else {\n");
+    s.push_str("            let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("            backend.tick_or_step();\n");
     s.push_str("        }\n");
     s.push_str("    }\n\n");
 
@@ -191,11 +273,44 @@ fn generate_main(
     s.push_str("        }\n");
     s.push_str("    }\n\n");
 
+    s.push_str("    fn is_task_finished(&self, task: u64) -> bool {\n");
+    s.push_str("        let tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("        tasks.get(&task).map(|entry| entry.finished).unwrap_or(false)\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn execute_one_coop_task(&self, task: u64) -> i32 {\n");
+    s.push_str("        if task == 0 {\n");
+    s.push_str("            return 0;\n");
+    s.push_str("        }\n");
+    s.push_str("        let job = {\n");
+    s.push_str("            let mut jobs = self.coop_jobs.lock().unwrap();\n");
+    s.push_str("            jobs.remove(&task)\n");
+    s.push_str("        };\n");
+    s.push_str("        let Some(job) = job else {\n");
+    s.push_str("            return 0;\n");
+    s.push_str("        };\n\n");
+    s.push_str("        self.record_task_started(task);\n");
+    s.push_str("        {\n");
+    s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
+    s.push_str("            if let Some(entry) = tasks.get_mut(&task) {\n");
+    s.push_str("                entry.started = true;\n");
+    s.push_str("            }\n");
+    s.push_str("        }\n\n");
+    s.push_str("        let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n");
+    s.push_str("            job(self, task)\n");
+    s.push_str("        }))\n");
+    s.push_str("        .unwrap_or(1);\n\n");
+    s.push_str("        self.mark_task_finished(task);\n");
+    s.push_str("        self.record_task_finished(task, exit);\n");
+    s.push_str("        exit\n");
+    s.push_str("    }\n\n");
+
     s.push_str("    fn spawn_task<F>(rt: &Arc<Self>, parent: u64, f: F) -> u64\n");
     s.push_str("    where\n");
     s.push_str("        F: FnOnce(Arc<Self>, u64) -> i32 + Send + 'static,\n");
     s.push_str("    {\n");
     s.push_str("        let child = rt.next_task_id.fetch_add(1, Ordering::SeqCst);\n");
+    s.push_str("        let _ = rt.backend_spawn(parent);\n");
     s.push_str("        let cancel = Arc::new(AtomicBool::new(false));\n\n");
 
     s.push_str("        {\n");
@@ -210,63 +325,110 @@ fn generate_main(
 
     s.push_str("        rt.record_task_spawned(parent, child);\n\n");
 
-    s.push_str("        let (started_tx, started_rx) = std::sync::mpsc::channel();\n");
-    s.push_str("        let rt_child = Arc::clone(rt);\n");
-    s.push_str("        let handle = std::thread::spawn(move || {\n");
-    s.push_str("            rt_child.record_task_started(child);\n");
-    s.push_str("            {\n");
-    s.push_str("                let mut tasks = rt_child.tasks.lock().unwrap();\n");
-    s.push_str("                if let Some(entry) = tasks.get_mut(&child) {\n");
-    s.push_str("                    entry.started = true;\n");
-    s.push_str("                }\n");
-    s.push_str("            }\n");
-    s.push_str("            let _ = started_tx.send(());\n\n");
+    if cfg!(feature = "coop_scheduler") {
+        s.push_str("        let rt_for_job = Arc::clone(rt);\n");
+        s.push_str("        let mut jobs = rt.coop_jobs.lock().unwrap();\n");
+        s.push_str(
+            "        jobs.insert(child, Box::new(move |_rt_ref: &Runtime, task_id: u64| -> i32 {\n",
+        );
+        s.push_str("            f(Arc::clone(&rt_for_job), task_id)\n");
+        s.push_str("        }));\n\n");
+    } else {
+        s.push_str("        let (started_tx, started_rx) = std::sync::mpsc::channel();\n");
+        s.push_str("        let rt_child = Arc::clone(rt);\n");
+        s.push_str("        let handle = std::thread::spawn(move || {\n");
+        s.push_str("            rt_child.record_task_started(child);\n");
+        s.push_str("            {\n");
+        s.push_str("                let mut tasks = rt_child.tasks.lock().unwrap();\n");
+        s.push_str("                if let Some(entry) = tasks.get_mut(&child) {\n");
+        s.push_str("                    entry.started = true;\n");
+        s.push_str("                }\n");
+        s.push_str("            }\n");
+        s.push_str("            let _ = started_tx.send(());\n\n");
 
-    s.push_str(
-        "            let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
-    );
-    s.push_str("                f(Arc::clone(&rt_child), child)\n");
-    s.push_str("            }))\n");
-    s.push_str("            .unwrap_or(1);\n\n");
+        s.push_str(
+            "            let exit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {\n",
+        );
+        s.push_str("                f(Arc::clone(&rt_child), child)\n");
+        s.push_str("            }))\n");
+        s.push_str("            .unwrap_or(1);\n\n");
 
-    s.push_str("            rt_child.mark_task_finished(child);\n");
-    s.push_str("            rt_child.record_task_finished(child, exit);\n");
-    s.push_str("            exit\n");
-    s.push_str("        });\n\n");
+        s.push_str("            rt_child.mark_task_finished(child);\n");
+        s.push_str("            rt_child.record_task_finished(child, exit);\n");
+        s.push_str("            exit\n");
+        s.push_str("        });\n\n");
 
-    s.push_str("        let _ = started_rx.recv();\n\n");
+        s.push_str("        let _ = started_rx.recv();\n\n");
 
-    s.push_str("        {\n");
-    s.push_str("            let mut tasks = rt.tasks.lock().unwrap();\n");
-    s.push_str("            if let Some(entry) = tasks.get_mut(&child) {\n");
-    s.push_str("                entry.handle = Some(handle);\n");
-    s.push_str("            }\n");
-    s.push_str("        }\n\n");
+        s.push_str("        {\n");
+        s.push_str("            let mut tasks = rt.tasks.lock().unwrap();\n");
+        s.push_str("            if let Some(entry) = tasks.get_mut(&child) {\n");
+        s.push_str("                entry.handle = Some(handle);\n");
+        s.push_str("            }\n");
+        s.push_str("        }\n\n");
+    }
 
     s.push_str("        child\n");
     s.push_str("    }\n\n");
 
-    s.push_str("    fn join_task(&self, joiner: u64, joined: u64) {\n");
-    s.push_str("        let handle = {\n");
-    s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
-    s.push_str("            let Some(entry) = tasks.get_mut(&joined) else {\n");
-    s.push_str("                return;\n");
-    s.push_str("            };\n");
-    s.push_str("            if entry.joined {\n");
-    s.push_str("                return;\n");
-    s.push_str("            }\n");
-    s.push_str("            entry.joined = true;\n");
-    s.push_str("            entry.handle.take()\n");
-    s.push_str("        };\n\n");
+    if cfg!(feature = "coop_scheduler") {
+        s.push_str("    fn join_task(&self, joiner: u64, joined: u64) {\n");
+        s.push_str("        let mut should_record = false;\n");
+        s.push_str("        {\n");
+        s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
+        s.push_str("            let Some(entry) = tasks.get_mut(&joined) else {\n");
+        s.push_str("                return;\n");
+        s.push_str("            };\n");
+        s.push_str("            if entry.joined {\n");
+        s.push_str("                return;\n");
+        s.push_str("            }\n");
+        s.push_str("            if entry.finished {\n");
+        s.push_str("                entry.joined = true;\n");
+        s.push_str("                should_record = true;\n");
+        s.push_str("            }\n");
+        s.push_str("        }\n\n");
 
-    s.push_str("        if let Some(h) = handle {\n");
-    s.push_str("            let _ = h.join();\n");
-    s.push_str("        }\n\n");
+        s.push_str("        if !should_record {\n");
+        s.push_str("            self.backend_request_join(joiner, joined);\n");
+        s.push_str("            while !self.is_task_finished(joined) {\n");
+        s.push_str("                self.backend_tick_or_step();\n");
+        s.push_str("            }\n");
+        s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
+        s.push_str("            if let Some(entry) = tasks.get_mut(&joined) {\n");
+        s.push_str("                if !entry.joined {\n");
+        s.push_str("                    entry.joined = true;\n");
+        s.push_str("                    should_record = true;\n");
+        s.push_str("                }\n");
+        s.push_str("            }\n");
+        s.push_str("        }\n\n");
 
-    s.push_str("        self.record_task_joined(joiner, joined);\n");
-    s.push_str("    }\n\n");
+        s.push_str("        if should_record {\n");
+        s.push_str("            self.record_task_joined(joiner, joined);\n");
+        s.push_str("        }\n");
+        s.push_str("    }\n\n");
+    } else {
+        s.push_str("    fn join_task(&self, joiner: u64, joined: u64) {\n");
+        s.push_str("        let handle = {\n");
+        s.push_str("            let mut tasks = self.tasks.lock().unwrap();\n");
+        s.push_str("            let Some(entry) = tasks.get_mut(&joined) else {\n");
+        s.push_str("                return;\n");
+        s.push_str("            };\n");
+        s.push_str("            if entry.joined {\n");
+        s.push_str("                return;\n");
+        s.push_str("            }\n");
+        s.push_str("            entry.joined = true;\n");
+        s.push_str("            entry.handle.take()\n");
+        s.push_str("        };\n\n");
 
+        s.push_str("        if let Some(h) = handle {\n");
+        s.push_str("            let _ = h.join();\n");
+        s.push_str("        }\n\n");
+
+        s.push_str("        self.record_task_joined(joiner, joined);\n");
+        s.push_str("    }\n\n");
+    }
     s.push_str("    fn cancel_subtree_bfs(&self, root: u64, reason: u32) {\n");
+    s.push_str("        let _ = self.backend_cancel_bfs(root);\n");
     s.push_str("        let mut queue = VecDeque::new();\n");
     s.push_str("        queue.push_back(root);\n\n");
 
@@ -380,6 +542,7 @@ fn generate_main(
 
     s.push_str("    let runtime = Arc::new(Runtime::new());\n");
     s.push_str("    runtime.init_root();\n");
+    s.push_str("    runtime.backend_tick_or_step();\n");
     s.push_str("    let guard = RootGuard::new(Arc::clone(&runtime));\n\n");
 
     s.push_str(
@@ -393,10 +556,11 @@ fn generate_main(
     s.push_str("    .unwrap_or(1);\n\n");
 
     s.push_str("    drop(guard);\n");
-    s.push_str("    runtime.finish_root(exit_code);\n");
+    s.push_str("    let final_exit = runtime.backend_forced_exit_code().unwrap_or(exit_code);\n");
+    s.push_str("    runtime.finish_root(final_exit);\n");
     s.push_str("    {\n");
     s.push_str("        let mut r = recorder().lock().unwrap();\n");
-    s.push_str("        r.record_run_finished(0, exit_code).unwrap();\n");
+    s.push_str("        r.record_run_finished(0, final_exit).unwrap();\n");
     s.push_str("    }\n");
     s.push_str("}\n\n");
 
@@ -404,7 +568,6 @@ fn generate_main(
 
     s
 }
-
 fn has_nex_main(program: &Program) -> bool {
     program.items.iter().any(|item| match item {
         Item::Function(f) => f.name == "main",

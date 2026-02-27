@@ -131,6 +131,7 @@ impl Scheduler {
             },
         );
         self.runnable.insert(child_id);
+        self.blocked.remove(&child_id);
 
         child_id
     }
@@ -140,27 +141,25 @@ impl Scheduler {
             return;
         }
 
-        let target_finished = self
-            .tasks
-            .get(&target)
-            .map(|t| matches!(t.status, TaskStatus::Finished { .. } | TaskStatus::Canceled))
-            .unwrap_or(false);
+        let Some(waiter_state) = self.tasks.get(&waiter) else {
+            return;
+        };
+        if !matches!(waiter_state.status, TaskStatus::Runnable) {
+            return;
+        }
 
-        if target_finished {
+        let Some(target_state) = self.tasks.get(&target) else {
+            return;
+        };
+        if matches!(
+            target_state.status,
+            TaskStatus::Finished { .. } | TaskStatus::Canceled
+        ) {
             return;
         }
 
         if let Some(waiter_state) = self.tasks.get_mut(&waiter) {
             waiter_state.status = TaskStatus::BlockedJoin { target };
-        } else {
-            self.tasks.insert(
-                waiter,
-                TaskState {
-                    parent: None,
-                    children: BTreeSet::new(),
-                    status: TaskStatus::BlockedJoin { target },
-                },
-            );
         }
 
         self.runnable.remove(&waiter);
@@ -254,7 +253,7 @@ impl Scheduler {
     }
 
     pub fn tick_once_with_log(&mut self, log: &mut dyn SchedLog) -> Option<TaskId> {
-        if self.state == SchedState::Init {
+        if self.state == SchedState::Init || self.state == SchedState::Finished {
             return None;
         }
 
@@ -273,9 +272,54 @@ impl Scheduler {
         );
 
         self.tick = self.tick.saturating_add(1);
-        self.reevaluate_state(log);
+        self.reevaluate_with_log(log);
 
         picked
+    }
+
+    pub fn has_task(&self, task: TaskId) -> bool {
+        self.tasks.contains_key(&task)
+    }
+
+    pub fn is_task_finished(&self, task: TaskId) -> bool {
+        self.tasks
+            .get(&task)
+            .map(|state| {
+                matches!(
+                    state.status,
+                    TaskStatus::Finished { .. } | TaskStatus::Canceled
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    pub fn all_tasks_terminal(&self) -> bool {
+        self.tasks.values().all(|state| {
+            matches!(
+                state.status,
+                TaskStatus::Finished { .. } | TaskStatus::Canceled
+            )
+        })
+    }
+
+    pub fn reevaluate_with_log(&mut self, log: &mut dyn SchedLog) {
+        if self.state == SchedState::Running && self.runnable.is_empty() {
+            self.transition_state(SchedState::Draining, log);
+        }
+
+        if self.state == SchedState::Draining
+            && self.runnable.is_empty()
+            && self.blocked.is_empty()
+            && self.all_tasks_terminal()
+        {
+            self.transition_state(SchedState::Finished, log);
+        }
+    }
+
+    pub fn force_finish_with_log(&mut self, log: &mut dyn SchedLog) {
+        if self.state != SchedState::Finished {
+            self.transition_state(SchedState::Finished, log);
+        }
     }
 
     fn next_id(&self) -> TaskId {
@@ -294,25 +338,6 @@ impl Scheduler {
                     self.join_waiters.remove(&target);
                 }
             }
-        }
-    }
-
-    fn reevaluate_state(&mut self, log: &mut dyn SchedLog) {
-        if self.state == SchedState::Running && self.runnable.is_empty() {
-            self.transition_state(SchedState::Draining, log);
-        }
-
-        let all_terminal = self
-            .tasks
-            .values()
-            .all(|t| matches!(t.status, TaskStatus::Finished { .. } | TaskStatus::Canceled));
-
-        if self.state == SchedState::Draining
-            && self.runnable.is_empty()
-            && self.blocked.is_empty()
-            && all_terminal
-        {
-            self.transition_state(SchedState::Finished, log);
         }
     }
 
