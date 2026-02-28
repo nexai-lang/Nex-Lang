@@ -11,9 +11,10 @@ use std::process::Command;
 pub fn build_project(
     program: &Program,
     build_dir: &Path,
-    out_dir: &Path,
     codegen_hash: [u8; 32],
     source_hash: [u8; 32],
+    policy_hash: [u8; 32],
+    agent_id: u32,
 ) -> Result<()> {
     if build_dir.exists() {
         fs::remove_dir_all(build_dir)?;
@@ -24,7 +25,7 @@ pub fn build_project(
 
     copy_runtime(build_dir)?;
 
-    let main_rs = generate_main(program, out_dir, codegen_hash, source_hash);
+    let main_rs = generate_main(program, codegen_hash, source_hash, policy_hash, agent_id);
     fs::write(build_dir.join("src/main.rs"), main_rs)?;
 
     fs::write(
@@ -40,6 +41,9 @@ coop_scheduler = []
 [dependencies]
 sha2 = "0.10"
 hex = "0.4"
+rand = "0.8"
+base64 = "0.22"
+ed25519-dalek = "2"
 "#,
     )?;
 
@@ -67,6 +71,19 @@ hex = "0.4"
     Ok(())
 }
 
+pub fn compute_codegen_hash(
+    program: &Program,
+    source_hash: [u8; 32],
+    policy_hash: [u8; 32],
+    agent_id: u32,
+) -> [u8; 32] {
+    let canonical = generate_main(program, [0u8; 32], source_hash, policy_hash, agent_id);
+    let mut hasher = sha2::Sha256::new();
+    use sha2::Digest as _;
+    hasher.update(canonical.as_bytes());
+    hasher.finalize().into()
+}
+
 fn copy_runtime(build_dir: &Path) -> Result<()> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let runtime_src = root.join("src/runtime");
@@ -87,9 +104,10 @@ fn copy_runtime(build_dir: &Path) -> Result<()> {
 
 fn generate_main(
     program: &Program,
-    out_dir: &Path,
     codegen_hash: [u8; 32],
     source_hash: [u8; 32],
+    policy_hash: [u8; 32],
+    agent_id: u32,
 ) -> String {
     let mut s = String::new();
 
@@ -630,19 +648,27 @@ fn generate_main(
     s.push_str("}\n\n");
 
     s.push_str("fn main() {\n");
-    s.push_str(&format!(
-        "    let out_dir = std::path::Path::new(r#\"{}\"#);\n",
-        out_dir.display()
-    ));
-    s.push_str("    std::fs::create_dir_all(out_dir).unwrap();\n");
-    s.push_str("    init_global_recorder_with_jsonl(out_dir, \"events.bin\", \"events.jsonl\").unwrap();\n");
+    s.push_str("    let out_dir = std::env::var(\"NEX_OUT_DIR\")\n");
+    s.push_str("        .ok()\n");
+    s.push_str("        .filter(|v| !v.trim().is_empty())\n");
+    s.push_str("        .map(std::path::PathBuf::from)\n");
+    s.push_str("        .unwrap_or_else(|| std::path::PathBuf::from(\"./nex_out\"));\n");
+    s.push_str("    let agent_id = std::env::var(\"NEX_AGENT_ID\")\n");
+    s.push_str("        .ok()\n");
+    s.push_str("        .and_then(|v| v.parse::<u32>().ok())\n");
+    s.push_str(&format!("        .unwrap_or({});\n", agent_id));
+    s.push_str("    std::fs::create_dir_all(&out_dir).unwrap();\n");
+    s.push_str("    init_global_recorder_with_jsonl(&out_dir, \"events.bin\", \"events.jsonl\").unwrap();\n");
     s.push_str("    {\n");
     s.push_str("        let mut r = recorder().lock().unwrap();\n");
     s.push_str("        r.set_hashes(");
-    s.push_str(&format!("{:?}, {:?}", codegen_hash, source_hash));
+    s.push_str(&format!(
+        "{:?}, {:?}, {:?}",
+        codegen_hash, source_hash, policy_hash
+    ));
     s.push_str(");\n");
+    s.push_str("        r.set_agent_id(agent_id);\n");
     s.push_str("    }\n\n");
-
     s.push_str("    let runtime = Arc::new(Runtime::new());\n");
     s.push_str("    runtime.init_root();\n");
     s.push_str("    runtime.backend_tick_or_step();\n");

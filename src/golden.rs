@@ -1,3 +1,4 @@
+use crate::runtime::identity;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
@@ -20,10 +21,13 @@ const KIND_TICK_END_U64: u64 = 13;
 const KIND_PICK_TASK_U64: u64 = 14;
 const KIND_YIELD_U64: u64 = 15;
 const KIND_FUEL_DEBIT_U64: u64 = 16;
+const KIND_EVIDENCE_FINAL_U64: u64 = 34;
 const KIND_RUN_FINISHED_U64: u64 = 0xFFFF;
 
+const KIND_TASK_FINISHED_U16: u16 = 7;
 const KIND_TASK_CANCELLED_U16: u16 = 8;
 const KIND_TASK_JOINED_U16: u16 = 9;
+const KIND_EVIDENCE_FINAL_U16: u16 = 34;
 const KIND_RUN_FINISHED_U16: u16 = 0xFFFF;
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +49,60 @@ struct RecordRef {
     record_len: usize,
     payload_offset: usize,
     payload_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct EvidencePayload {
+    agent_id: u32,
+    source_hash: [u8; 32],
+    codegen_hash: [u8; 32],
+    policy_hash: [u8; 32],
+    run_hash: [u8; 32],
+    public_key_b64: String,
+    signature_b64: String,
+    signature_range: (usize, usize),
+}
+
+fn decode_evidence_payload(payload: &[u8]) -> EvidencePayload {
+    assert!(
+        payload.len() >= 4 + 32 * 4 + 2 + 2,
+        "EvidenceFinal payload too short: {}",
+        payload.len()
+    );
+
+    let agent_id = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    let source_hash = payload[4..36].try_into().unwrap();
+    let codegen_hash = payload[36..68].try_into().unwrap();
+    let policy_hash = payload[68..100].try_into().unwrap();
+    let run_hash = payload[100..132].try_into().unwrap();
+
+    let pk_len = u16::from_le_bytes(payload[132..134].try_into().unwrap()) as usize;
+    let pk_start = 134usize;
+    let pk_end = pk_start + pk_len;
+    assert!(pk_end + 2 <= payload.len(), "EvidenceFinal pubkey out of bounds");
+
+    let sig_len = u16::from_le_bytes(payload[pk_end..pk_end + 2].try_into().unwrap()) as usize;
+    let sig_start = pk_end + 2;
+    let sig_end = sig_start + sig_len;
+    assert_eq!(sig_end, payload.len(), "EvidenceFinal signature bounds mismatch");
+
+    let public_key_b64 = std::str::from_utf8(&payload[pk_start..pk_end])
+        .expect("EvidenceFinal pubkey utf8")
+        .to_string();
+    let signature_b64 = std::str::from_utf8(&payload[sig_start..sig_end])
+        .expect("EvidenceFinal signature utf8")
+        .to_string();
+
+    EvidencePayload {
+        agent_id,
+        source_hash,
+        codegen_hash,
+        policy_hash,
+        run_hash,
+        public_key_b64,
+        signature_b64,
+        signature_range: (sig_start, sig_end),
+    }
 }
 
 #[test]
@@ -373,6 +431,237 @@ fn main() {
 }
 
 #[test]
+fn live_run_emits_signed_evidence() {
+    let (out_dir, build_dir) = unique_dirs("live_run_emits_signed_evidence");
+    let src_file = out_dir.join("signed_evidence_live.nex");
+    fs::write(&src_file, "fn main() { 1 + 2; }
+").expect("write source");
+
+    let run = run_nex(&["run", src_file.to_str().unwrap()], &out_dir, &build_dir);
+    assert_status_ok("nex run signed evidence", &run);
+
+    let bytes = fs::read(out_dir.join("events.bin")).expect("read events.bin");
+    let records = parse_records(&bytes);
+
+    let evidence_idxs: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.kind == KIND_EVIDENCE_FINAL_U16)
+        .map(|(idx, _)| idx)
+        .collect();
+    assert_eq!(evidence_idxs.len(), 1, "expected exactly one EvidenceFinal");
+
+    let run_finished_idx = records
+        .iter()
+        .position(|r| r.kind == KIND_RUN_FINISHED_U16)
+        .expect("missing RunFinished");
+    assert_eq!(
+        evidence_idxs[0] + 1,
+        run_finished_idx,
+        "EvidenceFinal must be immediately before RunFinished"
+    );
+
+    let evidence_ref = &records[evidence_idxs[0]];
+    let evidence = decode_evidence_payload(&bytes[evidence_ref.payload_offset..evidence_ref.payload_offset + evidence_ref.payload_len]);
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes[..LOG_HEADER_LEN]);
+    for rec in &records[..evidence_idxs[0]] {
+        hasher.update(&bytes[rec.record_offset..rec.record_offset + rec.record_len]);
+    }
+    let digest = hasher.finalize();
+    let mut computed = [0u8; 32];
+    computed.copy_from_slice(&digest[..]);
+
+    assert_eq!(
+        evidence.run_hash, computed,
+        "EvidenceFinal run hash must match canonical pre-evidence digest"
+    );
+
+    let public_key =
+        identity::decode_b64_fixed::<32>(&evidence.public_key_b64, "public_key_b64").expect("decode pubkey");
+    let signature =
+        identity::decode_b64_fixed::<64>(&evidence.signature_b64, "signature_b64").expect("decode signature");
+
+    assert!(identity::verify_evidence_signature(
+        &public_key,
+        &signature,
+        evidence.agent_id,
+        evidence.source_hash,
+        evidence.codegen_hash,
+        evidence.policy_hash,
+        evidence.run_hash,
+    ));
+}
+
+#[test]
+fn replay_verifies_signature_and_run_hash() {
+    let (out_dir, build_dir) = unique_dirs("replay_verifies_signature_and_run_hash");
+    let src_file = out_dir.join("replay_signed_ok.nex");
+    fs::write(&src_file, "fn main() { 1 + 2; }
+").expect("write source");
+
+    let run = run_nex(&["run", src_file.to_str().unwrap()], &out_dir, &build_dir);
+    assert_status_ok("nex run signed replay fixture", &run);
+
+    let replay = run_nex(
+        &["replay", out_dir.join("events.bin").to_str().unwrap()],
+        &out_dir,
+        &build_dir,
+    );
+    assert_status_ok("nex replay signed replay fixture", &replay);
+    assert!(
+        String::from_utf8_lossy(&replay.stdout).contains("✅ REPLAY OK"),
+        "expected REPLAY OK
+stdout:
+{}
+stderr:
+{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+}
+
+#[test]
+fn tamper_signature_fails() {
+    let (out_dir, build_dir) = unique_dirs("tamper_signature_fails");
+    let src_file = out_dir.join("tamper_signature_source.nex");
+    fs::write(&src_file, "fn main() { 1 + 2; }
+").expect("write source");
+
+    let run = run_nex(&["run", src_file.to_str().unwrap()], &out_dir, &build_dir);
+    assert_status_ok("nex run signature tamper fixture", &run);
+
+    let base = out_dir.join("events.bin");
+    let mut bytes = fs::read(&base).expect("read base log");
+    let records = parse_records(&bytes);
+    let evidence = records
+        .iter()
+        .find(|r| r.kind == KIND_EVIDENCE_FINAL_U16)
+        .expect("missing EvidenceFinal");
+
+    let decoded = decode_evidence_payload(
+        &bytes[evidence.payload_offset..evidence.payload_offset + evidence.payload_len],
+    );
+
+    let sig_abs_start = evidence.payload_offset + decoded.signature_range.0;
+    let sig_abs_end = evidence.payload_offset + decoded.signature_range.1;
+    assert!(sig_abs_end > sig_abs_start, "empty signature range");
+
+    bytes[sig_abs_start] = if bytes[sig_abs_start] == b'A' { b'B' } else { b'A' };
+
+    let tampered = out_dir.join("events.signature_tampered.bin");
+    fs::write(&tampered, &bytes).expect("write tampered log");
+
+    let replay = run_nex(&["replay", tampered.to_str().unwrap()], &out_dir, &build_dir);
+    assert!(!replay.status.success(), "expected replay failure for signature tamper");
+
+    let all = format!(
+        "{}
+{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        all.contains("EvidenceFinal signature verification failed"),
+        "expected signature verification failure, got:
+{}",
+        all
+    );
+    assert!(
+        !all.contains("✅ REPLAY OK"),
+        "tampered signature must not report REPLAY OK"
+    );
+}
+
+#[test]
+fn tamper_event_stream_fails() {
+    let (out_dir, build_dir) = unique_dirs("tamper_event_stream_fails");
+    let src_file = out_dir.join("tamper_event_source.nex");
+    fs::write(&src_file, "fn main() { 1 + 2; }
+").expect("write source");
+
+    let run = run_nex(&["run", src_file.to_str().unwrap()], &out_dir, &build_dir);
+    assert_status_ok("nex run event tamper fixture", &run);
+
+    let base = out_dir.join("events.bin");
+    let mut bytes = fs::read(&base).expect("read base log");
+    let records = parse_records(&bytes);
+
+    let task_finished = records
+        .iter()
+        .find(|r| r.kind == KIND_TASK_FINISHED_U16)
+        .expect("missing TaskFinished");
+    assert!(task_finished.payload_len >= 4, "TaskFinished payload too short");
+
+    let off = task_finished.payload_offset;
+    bytes[off] = bytes[off].wrapping_add(1);
+
+    let tampered = out_dir.join("events.payload_tampered.bin");
+    fs::write(&tampered, &bytes).expect("write tampered log");
+
+    let replay = run_nex(&["replay", tampered.to_str().unwrap()], &out_dir, &build_dir);
+    assert!(!replay.status.success(), "expected replay failure for event tamper");
+
+    let all = format!(
+        "{}
+{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    assert!(
+        all.contains("evidence run hash mismatch") || all.contains("run hash mismatch"),
+        "expected evidence/run hash mismatch, got:
+{}",
+        all
+    );
+    assert!(
+        !all.contains("✅ REPLAY OK"),
+        "tampered event stream must not report REPLAY OK"
+    );
+}
+
+#[test]
+fn key_rotation_keeps_old_evidence_verifiable() {
+    let (out_dir, build_dir) = unique_dirs("key_rotation_keeps_old_evidence_verifiable");
+    let src_file = out_dir.join("key_rotation_source.nex");
+    fs::write(&src_file, "fn main() { 1 + 2; }
+").expect("write source");
+
+    let run1 = run_nex(&["run", src_file.to_str().unwrap()], &out_dir, &build_dir);
+    assert_status_ok("nex run before key rotate", &run1);
+
+    let old_log = out_dir.join("events.before_rotate.bin");
+    fs::copy(out_dir.join("events.bin"), &old_log).expect("copy old log");
+
+    let nex_home = out_dir.join("nex_home");
+    identity::key_rotate_at(0, &nex_home).expect("rotate key");
+
+    let run2 = run_nex(&["run", src_file.to_str().unwrap()], &out_dir, &build_dir);
+    assert_status_ok("nex run after key rotate", &run2);
+
+    let replay_old = run_nex(&["replay", old_log.to_str().unwrap()], &out_dir, &build_dir);
+    assert_status_ok("nex replay old log after key rotation", &replay_old);
+    assert!(
+        String::from_utf8_lossy(&replay_old.stdout).contains("✅ REPLAY OK"),
+        "expected REPLAY OK for old log
+stdout:
+{}
+stderr:
+{}",
+        String::from_utf8_lossy(&replay_old.stdout),
+        String::from_utf8_lossy(&replay_old.stderr)
+    );
+
+    let pubhist = out_dir.join("nex_home").join("keys").join("agent_0.pubhist.jsonl");
+    let hist = fs::read_to_string(&pubhist).expect("read pubhist");
+    assert!(
+        !hist.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>().is_empty(),
+        "expected at least one archived public key in pubhist"
+    );
+}
+
+#[test]
 fn jsonl_is_overwritten_each_run_not_appended() {
     let (out_dir, build_dir) = unique_dirs("jsonl_overwrite");
     let src = manifest_root().join("examples/cancel_bfs.nex");
@@ -404,6 +693,8 @@ fn run_nex(args: &[&str], out_dir: &Path, build_dir: &Path) -> std::process::Out
         .args(args)
         .env("NEX_OUT_DIR", out_dir)
         .env("NEX_BUILD_DIR", build_dir)
+        .env("NEX_HOME", out_dir.join("nex_home"))
+        .env("NEX_AGENT_ID", "0")
         .output()
         .expect("failed to execute nex binary")
 }

@@ -62,6 +62,7 @@ pub enum EventKind {
     MessageBlocked = 31,
     ChannelCreated = 32,
     ChannelClosed = 33,
+    EvidenceFinal = 34,
 
     // ---- run framing ----
     RunStarted = 0xFFFE,
@@ -111,6 +112,7 @@ impl fmt::Display for EventKind {
             EventKind::MessageBlocked => "MessageBlocked",
             EventKind::ChannelCreated => "ChannelCreated",
             EventKind::ChannelClosed => "ChannelClosed",
+            EventKind::EvidenceFinal => "EvidenceFinal",
         };
         f.write_str(s)
     }
@@ -275,6 +277,75 @@ impl EncodeLE for RunFinished {
     fn encode_le(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.exit_code.to_le_bytes());
         dst.extend_from_slice(&self.run_hash_excluding_finish);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EvidenceVersion {
+    pub format: u32,
+    pub hash_alg: u32,
+    pub sig_alg: u32,
+}
+
+/// Payload: EvidenceFinal
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EvidenceFinal {
+    pub version: EvidenceVersion,
+    pub agent_id: u32,
+    pub source_hash: [u8; 32],
+    pub codegen_hash: [u8; 32],
+    pub policy_hash: [u8; 32],
+    pub run_hash: [u8; 32],
+    pub public_key_b64: String,
+    pub signature_b64: String,
+    pub provider_id: String,
+}
+
+impl EncodeLE for EvidenceFinal {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        4 + 4
+            + 4
+            + 4
+            + 32
+            + 32
+            + 32
+            + 32
+            + 2
+            + self.public_key_b64.len()
+            + 2
+            + self.signature_b64.len()
+            + 2
+            + self.provider_id.len()
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.version.format.to_le_bytes());
+        dst.extend_from_slice(&self.version.hash_alg.to_le_bytes());
+        dst.extend_from_slice(&self.version.sig_alg.to_le_bytes());
+        dst.extend_from_slice(&self.agent_id.to_le_bytes());
+        dst.extend_from_slice(&self.source_hash);
+        dst.extend_from_slice(&self.codegen_hash);
+        dst.extend_from_slice(&self.policy_hash);
+        dst.extend_from_slice(&self.run_hash);
+
+        let pk = self.public_key_b64.as_bytes();
+        let sig = self.signature_b64.as_bytes();
+        let provider = self.provider_id.as_bytes();
+
+        let pk_len = u16::try_from(pk.len()).unwrap_or(u16::MAX);
+        let sig_len = u16::try_from(sig.len()).unwrap_or(u16::MAX);
+        let provider_len = u16::try_from(provider.len()).unwrap_or(u16::MAX);
+
+        dst.extend_from_slice(&pk_len.to_le_bytes());
+        dst.extend_from_slice(&pk[..usize::from(pk_len)]);
+
+        dst.extend_from_slice(&sig_len.to_le_bytes());
+        dst.extend_from_slice(&sig[..usize::from(sig_len)]);
+
+        dst.extend_from_slice(&provider_len.to_le_bytes());
+        dst.extend_from_slice(&provider[..usize::from(provider_len)]);
     }
 }
 

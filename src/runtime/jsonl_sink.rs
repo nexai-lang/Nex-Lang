@@ -5,6 +5,7 @@
 
 use crate::runtime::event::*;
 use crate::runtime::event_sink::EventSink;
+use crate::runtime::identity;
 use crate::runtime::io_proxy::IoKind;
 use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
@@ -86,6 +87,34 @@ fn json_line_for_record(header: &EventHeader, payload: &[u8]) -> io::Result<Stri
             fields.push(format!(
                 r#""run_hash":"{}""#,
                 hex::encode(p.run_hash_excluding_finish)
+            ));
+        }
+
+        EventKind::EvidenceFinal => {
+            let p = decode_evidence_final(payload)?;
+            fields.push(r#""event":"EvidenceFinal""#.to_string());
+            fields.push(format!(r#""evidence_format":{}"#, p.version.format));
+            fields.push(format!(r#""hash_alg":{}"#, p.version.hash_alg));
+            fields.push(format!(r#""sig_alg":{}"#, p.version.sig_alg));
+            fields.push(format!(r#""agent_id":{}"#, p.agent_id));
+            fields.push(format!(r#""source_hash":"{}""#, hex::encode(p.source_hash)));
+            fields.push(format!(
+                r#""codegen_hash":"{}""#,
+                hex::encode(p.codegen_hash)
+            ));
+            fields.push(format!(r#""policy_hash":"{}""#, hex::encode(p.policy_hash)));
+            fields.push(format!(r#""run_hash":"{}""#, hex::encode(p.run_hash)));
+            fields.push(format!(
+                r#""public_key_b64":"{}""#,
+                escape_json(&p.public_key_b64)
+            ));
+            fields.push(format!(
+                r#""signature_b64":"{}""#,
+                escape_json(&p.signature_b64)
+            ));
+            fields.push(format!(
+                r#""provider_id":"{}""#,
+                escape_json(&p.provider_id)
             ));
         }
 
@@ -389,6 +418,237 @@ fn decode_run_finished(payload: &[u8]) -> io::Result<RunFinished> {
         exit_code: i32::from_le_bytes(payload[0..4].try_into().unwrap()),
         run_hash_excluding_finish: payload[4..36].try_into().unwrap(),
     })
+}
+
+fn decode_evidence_final(payload: &[u8]) -> io::Result<EvidenceFinal> {
+    const LEGACY_FIXED: usize = 4 + 32 * 4;
+    const V081_FIXED: usize = 4 + 4 + 4 + 4 + 32 * 4;
+
+    if payload.len() < LEGACY_FIXED + 2 + 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("EvidenceFinal payload too short: {}", payload.len()),
+        ));
+    }
+
+    let read_u32 = |off: usize, field: &str| -> io::Result<u32> {
+        let end = off.saturating_add(4);
+        let bytes = payload.get(off..end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("EvidenceFinal {} out of bounds", field),
+            )
+        })?;
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(bytes);
+        Ok(u32::from_le_bytes(arr))
+    };
+
+    let parse_tail = |prefix_len: usize,
+                      version: EvidenceVersion,
+                      agent_id: u32,
+                      source_hash: [u8; 32],
+                      codegen_hash: [u8; 32],
+                      policy_hash: [u8; 32],
+                      run_hash: [u8; 32]|
+     -> io::Result<EvidenceFinal> {
+        let pk_len_off = prefix_len;
+        let pk_len_end = pk_len_off.saturating_add(2);
+        let pk_len_bytes = payload.get(pk_len_off..pk_len_end).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "EvidenceFinal public key length out of bounds",
+            )
+        })?;
+        let pk_len = u16::from_le_bytes([pk_len_bytes[0], pk_len_bytes[1]]) as usize;
+
+        let pk_start = pk_len_end;
+        let pk_end = pk_start.saturating_add(pk_len);
+        if pk_end + 2 > payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "EvidenceFinal public key length out of bounds",
+            ));
+        }
+
+        let sig_len_bytes = &payload[pk_end..pk_end + 2];
+        let sig_len = u16::from_le_bytes([sig_len_bytes[0], sig_len_bytes[1]]) as usize;
+        let sig_start = pk_end + 2;
+        let sig_end = sig_start.saturating_add(sig_len);
+        if sig_end > payload.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "EvidenceFinal signature length mismatch",
+            ));
+        }
+
+        let public_key_b64 = std::str::from_utf8(&payload[pk_start..pk_end])
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("EvidenceFinal public key utf8: {}", e),
+                )
+            })?
+            .to_string();
+
+        let signature_b64 = std::str::from_utf8(&payload[sig_start..sig_end])
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("EvidenceFinal signature utf8: {}", e),
+                )
+            })?
+            .to_string();
+
+        let provider_id = if sig_end == payload.len() {
+            identity::FILE_IDENTITY_PROVIDER_ID.to_string()
+        } else {
+            if sig_end + 2 > payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EvidenceFinal provider_id length out of bounds",
+                ));
+            }
+            let provider_len =
+                u16::from_le_bytes([payload[sig_end], payload[sig_end + 1]]) as usize;
+            let provider_start = sig_end + 2;
+            let provider_end = provider_start.saturating_add(provider_len);
+            if provider_end != payload.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EvidenceFinal provider_id length mismatch",
+                ));
+            }
+            std::str::from_utf8(&payload[provider_start..provider_end])
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("EvidenceFinal provider_id utf8: {}", e),
+                    )
+                })?
+                .to_string()
+        };
+
+        Ok(EvidenceFinal {
+            version,
+            agent_id,
+            source_hash,
+            codegen_hash,
+            policy_hash,
+            run_hash,
+            public_key_b64,
+            signature_b64,
+            provider_id,
+        })
+    };
+
+    if payload.len() >= V081_FIXED + 2 + 2 {
+        let format = read_u32(0, "format")?;
+        let hash_alg = read_u32(4, "hash_alg")?;
+        let sig_alg = read_u32(8, "sig_alg")?;
+        if hash_alg == 1 && sig_alg == 1 {
+            if format != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unsupported evidence format: {}", format),
+                ));
+            }
+
+            let agent_id = read_u32(12, "agent_id")?;
+
+            let mut source_hash = [0u8; 32];
+            source_hash.copy_from_slice(payload.get(16..48).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EvidenceFinal source_hash out of bounds",
+                )
+            })?);
+
+            let mut codegen_hash = [0u8; 32];
+            codegen_hash.copy_from_slice(payload.get(48..80).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EvidenceFinal codegen_hash out of bounds",
+                )
+            })?);
+
+            let mut policy_hash = [0u8; 32];
+            policy_hash.copy_from_slice(payload.get(80..112).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EvidenceFinal policy_hash out of bounds",
+                )
+            })?);
+
+            let mut run_hash = [0u8; 32];
+            run_hash.copy_from_slice(payload.get(112..144).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "EvidenceFinal run_hash out of bounds",
+                )
+            })?);
+
+            return parse_tail(
+                V081_FIXED,
+                EvidenceVersion {
+                    format,
+                    hash_alg,
+                    sig_alg,
+                },
+                agent_id,
+                source_hash,
+                codegen_hash,
+                policy_hash,
+                run_hash,
+            );
+        }
+    }
+
+    let mut source_hash = [0u8; 32];
+    source_hash.copy_from_slice(payload.get(4..36).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EvidenceFinal source_hash out of bounds",
+        )
+    })?);
+
+    let mut codegen_hash = [0u8; 32];
+    codegen_hash.copy_from_slice(payload.get(36..68).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EvidenceFinal codegen_hash out of bounds",
+        )
+    })?);
+
+    let mut policy_hash = [0u8; 32];
+    policy_hash.copy_from_slice(payload.get(68..100).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EvidenceFinal policy_hash out of bounds",
+        )
+    })?);
+
+    let mut run_hash = [0u8; 32];
+    run_hash.copy_from_slice(payload.get(100..132).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "EvidenceFinal run_hash out of bounds",
+        )
+    })?);
+
+    parse_tail(
+        LEGACY_FIXED,
+        EvidenceVersion {
+            format: 0,
+            hash_alg: 1,
+            sig_alg: 1,
+        },
+        read_u32(0, "agent_id")?,
+        source_hash,
+        codegen_hash,
+        policy_hash,
+        run_hash,
+    )
 }
 
 fn decode_task_finished(payload: &[u8]) -> io::Result<TaskFinished> {

@@ -16,13 +16,15 @@ use sha2::{Digest, Sha256};
 use super::crc32::crc32_ieee;
 use super::event::{
     BusDecision, BusRecv, BusSend, BusSendRequest, BusSendResult, CapabilityInvoked, ChannelClosed,
-    ChannelCreated, DeadlockDetected, DeadlockEdge, EncodeLE, EventHeader, EventKind, FuelDebit,
-    FuelReason, IoBegin, IoDecision, IoPayload, IoRequest, IoResult, MessageBlocked,
-    MessageDelivered, MessageSent, PickTask, ResourceViolation, RunFinished, SchedInit, SchedState,
-    SchedStatePayload, TaskCancelled, TaskFinished, TaskJoined, TaskSpawned, TaskStarted, TickEnd,
-    TickStart, YieldKind, YieldPayload, EVENT_MAGIC, EVENT_VERSION,
+    ChannelCreated, DeadlockDetected, DeadlockEdge, EncodeLE, EventHeader, EventKind,
+    EvidenceFinal, EvidenceVersion, FuelDebit, FuelReason, IoBegin, IoDecision, IoPayload,
+    IoRequest, IoResult, MessageBlocked, MessageDelivered, MessageSent, PickTask,
+    ResourceViolation, RunFinished, SchedInit, SchedState, SchedStatePayload, TaskCancelled,
+    TaskFinished, TaskJoined, TaskSpawned, TaskStarted, TickEnd, TickStart, YieldKind,
+    YieldPayload, EVENT_MAGIC, EVENT_VERSION,
 };
 use super::event_sink::EventSink;
+use super::identity::{self, IdentityProvider};
 use super::io_proxy::IoKind;
 use super::jsonl_sink::JsonlSink;
 
@@ -66,12 +68,16 @@ pub struct EventRecorder {
     out_path: PathBuf,
     writer: BufWriter<File>,
     hasher: Sha256,
+    event_count: u64,
     wrote_preamble: bool,
     sinks: Vec<Box<dyn EventSink>>,
 
     flags: u16,
     codegen_hash: [u8; 32],
     source_hash: [u8; 32],
+    policy_hash: [u8; 32],
+    agent_id: u32,
+    evidence_emitted: bool,
 }
 
 impl EventRecorder {
@@ -89,11 +95,15 @@ impl EventRecorder {
             out_path,
             writer: BufWriter::new(file),
             hasher: Sha256::new(),
+            event_count: 0,
             wrote_preamble: false,
             sinks: Vec::new(),
             flags: 0,
             codegen_hash: [0u8; 32],
             source_hash: [0u8; 32],
+            policy_hash: [0u8; 32],
+            agent_id: 0,
+            evidence_emitted: false,
         })
     }
 
@@ -105,9 +115,19 @@ impl EventRecorder {
         Ok(())
     }
 
-    pub fn set_hashes(&mut self, codegen_hash: [u8; 32], source_hash: [u8; 32]) {
+    pub fn set_hashes(
+        &mut self,
+        codegen_hash: [u8; 32],
+        source_hash: [u8; 32],
+        policy_hash: [u8; 32],
+    ) {
         self.codegen_hash = codegen_hash;
         self.source_hash = source_hash;
+        self.policy_hash = policy_hash;
+    }
+
+    pub fn set_agent_id(&mut self, agent_id: u32) {
+        self.agent_id = agent_id;
     }
 
     pub fn set_flags(&mut self, flags: u16) {
@@ -155,9 +175,12 @@ impl EventRecorder {
         };
 
         let header_bytes = header.encode();
+        let mut record_bytes = Vec::with_capacity(EventHeader::ENCODED_LEN + payload.len());
+        record_bytes.extend_from_slice(&header_bytes);
+        record_bytes.extend_from_slice(payload);
 
-        self.write_and_hash(&header_bytes)?;
-        self.write_and_hash(payload)?;
+        self.write_and_hash(&record_bytes)?;
+        self.event_count = self.event_count.saturating_add(1);
         self.writer.flush()?;
 
         for sink in &mut self.sinks {
@@ -608,10 +631,62 @@ impl EventRecorder {
         self.record_event(task, EventKind::ResourceViolation, &payload)
     }
 
+    fn identity_provider(&self) -> identity::FileIdentityProvider {
+        identity::default_file_identity_provider(self.agent_id)
+    }
+
+    pub fn record_evidence_final(&mut self, root: u64) -> io::Result<u64> {
+        self.ensure_preamble()?;
+
+        if self.evidence_emitted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "EvidenceFinal already recorded",
+            ));
+        }
+
+        let run_hash_arr = self.current_stream_hash();
+
+        let provider = self.identity_provider();
+        let version = identity::EvidenceVersion::v0_8_1();
+        let signature = identity::sign_evidence_v0_8_1_with_provider(
+            &provider,
+            version,
+            self.agent_id,
+            self.source_hash,
+            self.codegen_hash,
+            self.policy_hash,
+            run_hash_arr,
+        )?;
+
+        let payload = EvidenceFinal {
+            version: EvidenceVersion {
+                format: version.format,
+                hash_alg: version.hash_alg.as_u32(),
+                sig_alg: version.sig_alg.as_u32(),
+            },
+            agent_id: self.agent_id,
+            source_hash: self.source_hash,
+            codegen_hash: self.codegen_hash,
+            policy_hash: self.policy_hash,
+            run_hash: run_hash_arr,
+            public_key_b64: identity::encode_b64(&provider.public_key()?),
+            signature_b64: identity::encode_b64(&signature),
+            provider_id: provider.provider_id().to_string(),
+        }
+        .to_bytes_le();
+
+        let seq = self.record_event(root, EventKind::EvidenceFinal, &payload)?;
+        self.evidence_emitted = true;
+        Ok(seq)
+    }
+
     pub fn record_run_finished(&mut self, root: u64, exit: i32) -> io::Result<u64> {
-        let hash = self.hasher.clone().finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&hash[..]);
+        if !self.evidence_emitted {
+            let _ = self.record_evidence_final(root)?;
+        }
+
+        let arr = self.current_stream_hash();
 
         let payload = RunFinished {
             exit_code: exit,
@@ -626,5 +701,12 @@ impl EventRecorder {
         self.writer.write_all(bytes)?;
         self.hasher.update(bytes);
         Ok(())
+    }
+
+    fn current_stream_hash(&self) -> [u8; 32] {
+        let digest = self.hasher.clone().finalize();
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&digest[..]);
+        out
     }
 }

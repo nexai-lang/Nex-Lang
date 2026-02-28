@@ -68,6 +68,7 @@ pub const KIND_MESSAGE_DELIVERED: u16 = 30;
 pub const KIND_MESSAGE_BLOCKED: u16 = 31;
 pub const KIND_CHANNEL_CREATED: u16 = 32;
 pub const KIND_CHANNEL_CLOSED: u16 = 33;
+pub const KIND_EVIDENCE_FINAL: u16 = 34;
 
 // Reserved high kinds
 pub const KIND_RUN_STARTED: u16 = 0xFFFE;

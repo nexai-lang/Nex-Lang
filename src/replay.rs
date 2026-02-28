@@ -7,12 +7,14 @@ use crate::runtime::event::{SchedState, YieldKind};
 use crate::runtime::event_reader::{
     EventReader, KIND_BUS_DECISION, KIND_BUS_RECV, KIND_BUS_SEND, KIND_BUS_SEND_REQUEST,
     KIND_BUS_SEND_RESULT, KIND_CAPABILITY_INVOKED, KIND_CHANNEL_CLOSED, KIND_CHANNEL_CREATED,
-    KIND_DEADLOCK_DETECTED, KIND_DEADLOCK_EDGE, KIND_FUEL_DEBIT, KIND_IO_BEGIN, KIND_IO_DECISION,
-    KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT, KIND_MESSAGE_BLOCKED, KIND_MESSAGE_DELIVERED,
-    KIND_MESSAGE_SENT, KIND_PICK_TASK, KIND_RESOURCE_VIOLATION, KIND_RUN_FINISHED, KIND_SCHED_INIT,
-    KIND_SCHED_STATE, KIND_TASK_CANCELLED, KIND_TASK_FINISHED, KIND_TASK_JOINED, KIND_TASK_SPAWNED,
+    KIND_DEADLOCK_DETECTED, KIND_DEADLOCK_EDGE, KIND_EVIDENCE_FINAL, KIND_FUEL_DEBIT,
+    KIND_IO_BEGIN, KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT,
+    KIND_MESSAGE_BLOCKED, KIND_MESSAGE_DELIVERED, KIND_MESSAGE_SENT, KIND_PICK_TASK,
+    KIND_RESOURCE_VIOLATION, KIND_RUN_FINISHED, KIND_SCHED_INIT, KIND_SCHED_STATE,
+    KIND_TASK_CANCELLED, KIND_TASK_FINISHED, KIND_TASK_JOINED, KIND_TASK_SPAWNED,
     KIND_TASK_STARTED, KIND_TICK_END, KIND_TICK_START, KIND_YIELD, RECORD_HEADER_LEN,
 };
+use crate::runtime::identity;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -83,6 +85,30 @@ pub struct ReplayResult {
 
     pub cap_allowed_total: u64,
     pub cap_denied_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplayOptions {
+    pub zero_trust: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidenceSigMode {
+    LegacyV080,
+    V081(identity::EvidenceVersion),
+}
+
+#[derive(Debug, Clone)]
+struct EvidenceFinalParsed {
+    sig_mode: EvidenceSigMode,
+    agent_id: u32,
+    source_hash: [u8; 32],
+    codegen_hash: [u8; 32],
+    policy_hash: [u8; 32],
+    run_hash: [u8; 32],
+    public_key_b64: String,
+    signature_b64: String,
+    provider_id: String,
 }
 
 fn err_invalid(msg: impl Into<String>) -> io::Error {
@@ -577,6 +603,142 @@ fn decode_deadlock_edge(payload: &[u8]) -> io::Result<(u32, u32, u8)> {
     }
 }
 
+fn decode_evidence_final(payload: &[u8]) -> io::Result<EvidenceFinalParsed> {
+    const LEGACY_FIXED: usize = 4 + 32 * 4;
+    const V081_FIXED: usize = 4 + 4 + 4 + 4 + 32 * 4;
+
+    if payload.len() < LEGACY_FIXED + 2 + 2 {
+        return Err(err_invalid(format!(
+            "EvidenceFinal payload too short: {}",
+            payload.len()
+        )));
+    }
+
+    fn read_u32_at(payload: &[u8], off: usize, field: &str) -> io::Result<u32> {
+        let end = off.saturating_add(4);
+        let bytes = payload
+            .get(off..end)
+            .ok_or_else(|| err_invalid(format!("EvidenceFinal {} out of bounds", field)))?;
+        let mut arr = [0u8; 4];
+        arr.copy_from_slice(bytes);
+        Ok(u32::from_le_bytes(arr))
+    }
+
+    fn read_arr32_at(payload: &[u8], off: usize, field: &str) -> io::Result<[u8; 32]> {
+        let end = off.saturating_add(32);
+        let bytes = payload
+            .get(off..end)
+            .ok_or_else(|| err_invalid(format!("EvidenceFinal {} out of bounds", field)))?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(bytes);
+        Ok(out)
+    }
+
+    fn parse_tail(payload: &[u8], prefix_len: usize) -> io::Result<(String, String, String)> {
+        let pk_len_end = prefix_len.saturating_add(2);
+        let pk_len_bytes = payload
+            .get(prefix_len..pk_len_end)
+            .ok_or_else(|| err_invalid("EvidenceFinal public key length out of bounds"))?;
+        let pk_len = u16::from_le_bytes([pk_len_bytes[0], pk_len_bytes[1]]) as usize;
+
+        let pk_start = pk_len_end;
+        let pk_end = pk_start.saturating_add(pk_len);
+        if pk_end + 2 > payload.len() {
+            return Err(err_invalid("EvidenceFinal public key length out of bounds"));
+        }
+
+        let sig_len_bytes = &payload[pk_end..pk_end + 2];
+        let sig_len = u16::from_le_bytes([sig_len_bytes[0], sig_len_bytes[1]]) as usize;
+        let sig_start = pk_end + 2;
+        let sig_end = sig_start.saturating_add(sig_len);
+        if sig_end > payload.len() {
+            return Err(err_invalid("EvidenceFinal signature length mismatch"));
+        }
+
+        let public_key_b64 = std::str::from_utf8(&payload[pk_start..pk_end])
+            .map_err(|e| err_invalid(format!("EvidenceFinal public key utf8: {}", e)))?
+            .to_string();
+
+        let signature_b64 = std::str::from_utf8(&payload[sig_start..sig_end])
+            .map_err(|e| err_invalid(format!("EvidenceFinal signature utf8: {}", e)))?
+            .to_string();
+
+        let provider_id = if sig_end == payload.len() {
+            identity::FILE_IDENTITY_PROVIDER_ID.to_string()
+        } else {
+            if sig_end + 2 > payload.len() {
+                return Err(err_invalid(
+                    "EvidenceFinal provider_id length out of bounds",
+                ));
+            }
+            let provider_len =
+                u16::from_le_bytes([payload[sig_end], payload[sig_end + 1]]) as usize;
+            let provider_start = sig_end + 2;
+            let provider_end = provider_start.saturating_add(provider_len);
+            if provider_end != payload.len() {
+                return Err(err_invalid("EvidenceFinal provider_id length mismatch"));
+            }
+            std::str::from_utf8(&payload[provider_start..provider_end])
+                .map_err(|e| err_invalid(format!("EvidenceFinal provider_id utf8: {}", e)))?
+                .to_string()
+        };
+
+        Ok((public_key_b64, signature_b64, provider_id))
+    }
+
+    if payload.len() >= V081_FIXED + 2 + 2 {
+        let format = read_u32_at(payload, 0, "format")?;
+        let hash_alg_raw = read_u32_at(payload, 4, "hash_alg")?;
+        let sig_alg_raw = read_u32_at(payload, 8, "sig_alg")?;
+
+        if let Ok((public_key_b64, signature_b64, provider_id)) = parse_tail(payload, V081_FIXED) {
+            let hash_alg = identity::HashAlg::from_u32(hash_alg_raw).ok_or_else(|| {
+                err_invalid(format!("unsupported evidence hash_alg: {}", hash_alg_raw))
+            })?;
+            let sig_alg = identity::SigAlg::from_u32(sig_alg_raw).ok_or_else(|| {
+                err_invalid(format!("unsupported evidence sig_alg: {}", sig_alg_raw))
+            })?;
+            if format != identity::EvidenceVersion::FORMAT_V0_8_1 {
+                return Err(err_invalid(format!(
+                    "unsupported evidence format: {}",
+                    format
+                )));
+            }
+
+            let version = identity::EvidenceVersion {
+                format,
+                hash_alg,
+                sig_alg,
+            };
+
+            return Ok(EvidenceFinalParsed {
+                sig_mode: EvidenceSigMode::V081(version),
+                agent_id: read_u32_at(payload, 12, "agent_id")?,
+                source_hash: read_arr32_at(payload, 16, "source_hash")?,
+                codegen_hash: read_arr32_at(payload, 48, "codegen_hash")?,
+                policy_hash: read_arr32_at(payload, 80, "policy_hash")?,
+                run_hash: read_arr32_at(payload, 112, "run_hash")?,
+                public_key_b64,
+                signature_b64,
+                provider_id,
+            });
+        }
+    }
+
+    let (public_key_b64, signature_b64, provider_id) = parse_tail(payload, LEGACY_FIXED)?;
+    Ok(EvidenceFinalParsed {
+        sig_mode: EvidenceSigMode::LegacyV080,
+        agent_id: read_u32_at(payload, 0, "agent_id")?,
+        source_hash: read_arr32_at(payload, 4, "source_hash")?,
+        codegen_hash: read_arr32_at(payload, 36, "codegen_hash")?,
+        policy_hash: read_arr32_at(payload, 68, "policy_hash")?,
+        run_hash: read_arr32_at(payload, 100, "run_hash")?,
+        public_key_b64,
+        signature_b64,
+        provider_id,
+    })
+}
+
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;
     for b in bytes {
@@ -615,6 +777,13 @@ fn is_allowed_sched_transition(from: SchedState, to: SchedState) -> bool {
 }
 
 pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
+    verify_log_with_options(path, ReplayOptions::default())
+}
+
+pub fn verify_log_with_options<P: AsRef<Path>>(
+    path: P,
+    options: ReplayOptions,
+) -> io::Result<ReplayResult> {
     let path = path.as_ref();
     let f = File::open(path)
         .map_err(|e| io::Error::new(e.kind(), format!("open {:?}: {}", path, e)))?;
@@ -622,10 +791,14 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
 
     let header = reader.read_log_header()?;
 
-    let mut hasher = Sha256::new();
-    hasher.update(&header.raw);
+    let mut run_hash_hasher = Sha256::new();
+    run_hash_hasher.update(&header.raw);
+    let mut evidence_run_hasher = Sha256::new();
+    evidence_run_hasher.update(&header.raw);
 
     let mut expected_run_hash: Option<[u8; 32]> = None;
+    let mut evidence_final: Option<EvidenceFinalParsed> = None;
+    let mut saw_evidence_final = false;
     let mut exit_code: Option<i32> = None;
     let mut run_finished_seq: Option<u64> = None;
 
@@ -670,6 +843,13 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
         if seen_run_finished {
             return Err(err_invalid(format!(
                 "Event after RunFinished: seq={} task={} kind={}",
+                ev.seq, ev.task_id, ev.kind
+            )));
+        }
+
+        if saw_evidence_final && ev.kind != KIND_RUN_FINISHED {
+            return Err(err_invalid(format!(
+                "Event after EvidenceFinal before RunFinished: seq={} task={} kind={}",
                 ev.seq, ev.task_id, ev.kind
             )));
         }
@@ -1838,6 +2018,20 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
         rec.extend_from_slice(&payload_len.to_le_bytes());
         rec.extend_from_slice(&ev.payload);
 
+        if ev.kind == KIND_EVIDENCE_FINAL {
+            if saw_evidence_final {
+                return Err(err_invalid(format!(
+                    "duplicate EvidenceFinal at seq={}",
+                    ev.seq
+                )));
+            }
+            saw_evidence_final = true;
+            evidence_final = Some(decode_evidence_final(&ev.payload)?);
+
+            run_hash_hasher.update(&rec);
+            continue;
+        }
+
         if ev.kind == KIND_RUN_FINISHED {
             if seen_run_finished {
                 return Err(err_invalid(format!(
@@ -1863,7 +2057,10 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
             continue;
         }
 
-        hasher.update(&rec);
+        run_hash_hasher.update(&rec);
+        if !saw_evidence_final {
+            evidence_run_hasher.update(&rec);
+        }
     }
 
     if !seen_run_finished {
@@ -1962,7 +2159,88 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
         )));
     }
 
-    let computed = hasher.finalize();
+    if !saw_evidence_final {
+        return Err(err_invalid("missing EvidenceFinal record"));
+    }
+
+    let evidence = evidence_final.ok_or_else(|| err_invalid("missing EvidenceFinal record"))?;
+
+    if evidence.source_hash != header.source_hash {
+        return Err(err_invalid(format!(
+            "EvidenceFinal source_hash mismatch: header={} evidence={}",
+            hex::encode(header.source_hash),
+            hex::encode(evidence.source_hash)
+        )));
+    }
+
+    if evidence.codegen_hash != header.codegen_hash {
+        return Err(err_invalid(format!(
+            "EvidenceFinal codegen_hash mismatch: header={} evidence={}",
+            hex::encode(header.codegen_hash),
+            hex::encode(evidence.codegen_hash)
+        )));
+    }
+
+    let evidence_digest = evidence_run_hasher.finalize();
+    let mut evidence_digest_arr = [0u8; 32];
+    evidence_digest_arr.copy_from_slice(&evidence_digest[..]);
+
+    if evidence.run_hash != evidence_digest_arr {
+        return Err(err_invalid(format!(
+            "evidence run hash mismatch: expected {}, computed {}",
+            hex::encode(evidence.run_hash),
+            hex::encode(evidence_digest_arr)
+        )));
+    }
+
+    if evidence.provider_id != identity::FILE_IDENTITY_PROVIDER_ID {
+        return Err(err_invalid(format!(
+            "unsupported identity provider: {}",
+            evidence.provider_id
+        )));
+    }
+
+    if options.zero_trust {
+        let trusted = identity::is_public_key_trusted_at(
+            &identity::resolve_home_root(),
+            &evidence.public_key_b64,
+        )?;
+        if !trusted {
+            return Err(err_invalid(
+                "zero-trust replay rejected untrusted public key",
+            ));
+        }
+    }
+
+    let public_key = identity::decode_b64_fixed::<32>(&evidence.public_key_b64, "public_key_b64")?;
+    let signature = identity::decode_b64_fixed::<64>(&evidence.signature_b64, "signature_b64")?;
+
+    let sig_ok = match evidence.sig_mode {
+        EvidenceSigMode::LegacyV080 => identity::verify_evidence_signature_legacy(
+            &public_key,
+            &signature,
+            evidence.agent_id,
+            evidence.source_hash,
+            evidence.codegen_hash,
+            evidence.policy_hash,
+            evidence.run_hash,
+        ),
+        EvidenceSigMode::V081(version) => identity::verify_evidence_signature_v0_8_1(
+            &public_key,
+            &signature,
+            version,
+            evidence.agent_id,
+            evidence.source_hash,
+            evidence.codegen_hash,
+            evidence.policy_hash,
+            evidence.run_hash,
+        ),
+    };
+    if !sig_ok {
+        return Err(err_invalid("EvidenceFinal signature verification failed"));
+    }
+
+    let computed = run_hash_hasher.finalize();
     let mut computed_arr = [0u8; 32];
     computed_arr.copy_from_slice(&computed[..]);
 
@@ -1993,11 +2271,12 @@ mod tests {
     use crate::runtime::crc32::crc32_ieee;
     use crate::runtime::event_reader::{
         KIND_BUS_DECISION, KIND_BUS_RECV, KIND_BUS_SEND, KIND_BUS_SEND_REQUEST,
-        KIND_BUS_SEND_RESULT, KIND_DEADLOCK_DETECTED, KIND_DEADLOCK_EDGE, KIND_IO_BEGIN,
-        KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT, KIND_RUN_FINISHED,
-        KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_FINISHED, KIND_TASK_STARTED, KIND_TICK_END,
-        KIND_TICK_START, LOG_HEADER_LEN, LOG_MAGIC, LOG_VERSION,
+        KIND_BUS_SEND_RESULT, KIND_DEADLOCK_DETECTED, KIND_DEADLOCK_EDGE, KIND_EVIDENCE_FINAL,
+        KIND_IO_BEGIN, KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT,
+        KIND_RUN_FINISHED, KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_FINISHED,
+        KIND_TASK_STARTED, KIND_TICK_END, KIND_TICK_START, LOG_HEADER_LEN, LOG_MAGIC, LOG_VERSION,
     };
+    use crate::runtime::identity;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2581,17 +2860,73 @@ mod tests {
     ) -> Vec<u8> {
         let header = build_header_with_flags(flags);
 
-        let mut hasher = Sha256::new();
-        hasher.update(header);
+        let mut evidence_hasher = Sha256::new();
+        evidence_hasher.update(header);
         for rec in &records {
-            hasher.update(rec);
+            evidence_hasher.update(rec);
         }
-        let digest = hasher.finalize();
+        let evidence_digest = evidence_hasher.finalize();
+
+        let mut evidence_run_hash = [0u8; 32];
+        evidence_run_hash.copy_from_slice(&evidence_digest[..]);
+
+        let secret_key = [7u8; 32];
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key);
+        let keypair = identity::IdentityKeypair {
+            public_key: signing_key.verifying_key().to_bytes(),
+            secret_key,
+        };
+
+        let source_hash = [0x22u8; 32];
+        let codegen_hash = [0x11u8; 32];
+        let policy_hash = [0x33u8; 32];
+        let signature = identity::sign_evidence(
+            &keypair,
+            0,
+            source_hash,
+            codegen_hash,
+            policy_hash,
+            evidence_run_hash,
+        );
+
+        let mut evidence_payload = Vec::new();
+        evidence_payload.extend_from_slice(&0u32.to_le_bytes());
+        evidence_payload.extend_from_slice(&source_hash);
+        evidence_payload.extend_from_slice(&codegen_hash);
+        evidence_payload.extend_from_slice(&policy_hash);
+        evidence_payload.extend_from_slice(&evidence_run_hash);
+
+        let public_key_b64 = identity::encode_b64(&keypair.public_key);
+        let signature_b64 = identity::encode_b64(&signature);
+
+        evidence_payload.extend_from_slice(&(public_key_b64.len() as u16).to_le_bytes());
+        evidence_payload.extend_from_slice(public_key_b64.as_bytes());
+        evidence_payload.extend_from_slice(&(signature_b64.len() as u16).to_le_bytes());
+        evidence_payload.extend_from_slice(signature_b64.as_bytes());
+
+        records.push(record(
+            run_finished_seq,
+            0,
+            KIND_EVIDENCE_FINAL,
+            &evidence_payload,
+        ));
+
+        let mut run_hash_hasher = Sha256::new();
+        run_hash_hasher.update(header);
+        for rec in &records {
+            run_hash_hasher.update(rec);
+        }
+        let run_digest = run_hash_hasher.finalize();
 
         let mut run_payload = Vec::with_capacity(36);
         run_payload.extend_from_slice(&exit_code.to_le_bytes());
-        run_payload.extend_from_slice(&digest);
-        records.push(record(run_finished_seq, 0, KIND_RUN_FINISHED, &run_payload));
+        run_payload.extend_from_slice(&run_digest);
+        records.push(record(
+            run_finished_seq.saturating_add(1),
+            0,
+            KIND_RUN_FINISHED,
+            &run_payload,
+        ));
 
         let mut out = Vec::new();
         out.extend_from_slice(&header);
