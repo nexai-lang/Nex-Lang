@@ -5,11 +5,13 @@
 
 use crate::runtime::event::{SchedState, YieldKind};
 use crate::runtime::event_reader::{
-    EventReader, KIND_CAPABILITY_INVOKED, KIND_FUEL_DEBIT, KIND_IO_DECISION, KIND_IO_PAYLOAD,
-    KIND_IO_REQUEST, KIND_IO_RESULT, KIND_PICK_TASK, KIND_RESOURCE_VIOLATION, KIND_RUN_FINISHED,
-    KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_CANCELLED, KIND_TASK_FINISHED, KIND_TASK_JOINED,
-    KIND_TASK_SPAWNED, KIND_TASK_STARTED, KIND_TICK_END, KIND_TICK_START, KIND_YIELD,
-    RECORD_HEADER_LEN,
+    EventReader, KIND_BUS_DECISION, KIND_BUS_RECV, KIND_BUS_SEND, KIND_BUS_SEND_REQUEST,
+    KIND_BUS_SEND_RESULT, KIND_CAPABILITY_INVOKED, KIND_CHANNEL_CLOSED, KIND_CHANNEL_CREATED,
+    KIND_DEADLOCK_DETECTED, KIND_DEADLOCK_EDGE, KIND_FUEL_DEBIT, KIND_IO_BEGIN, KIND_IO_DECISION,
+    KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT, KIND_MESSAGE_BLOCKED, KIND_MESSAGE_DELIVERED,
+    KIND_MESSAGE_SENT, KIND_PICK_TASK, KIND_RESOURCE_VIOLATION, KIND_RUN_FINISHED, KIND_SCHED_INIT,
+    KIND_SCHED_STATE, KIND_TASK_CANCELLED, KIND_TASK_FINISHED, KIND_TASK_JOINED, KIND_TASK_SPAWNED,
+    KIND_TASK_STARTED, KIND_TICK_END, KIND_TICK_START, KIND_YIELD, RECORD_HEADER_LEN,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,6 +26,12 @@ const IO_KIND_FS_WRITE: u8 = 2;
 const IO_KIND_NET_CONNECT: u8 = 3;
 const IO_KIND_NET_SEND: u8 = 4;
 const IO_KIND_NET_RECV: u8 = 5;
+const IO_REASON_ALLOWED: u32 = 0;
+const IO_REASON_DENIED_MISSING_CAPABILITY: u32 = 1;
+const IO_REASON_DENIED_FUEL: u32 = 2;
+const IO_REASON_DENIED_POLICY: u32 = 3;
+const IO_REASON_DENIED_BACKPRESSURE: u32 = 4;
+const COOP_EXIT_DEADLOCK: i32 = 75;
 
 #[derive(Debug, Default)]
 struct TaskState {
@@ -34,19 +42,31 @@ struct TaskState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BusSendReqState {
+    sender: u32,
+    receiver: u32,
+    decided: bool,
+    decision_allowed: bool,
+    result_seen: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingIoState {
     AwaitDecision {
         request_seq: u64,
         kind: u8,
+        req_id: u64,
     },
     AwaitPayload {
         request_seq: u64,
         kind: u8,
+        req_id: u64,
         allowed: bool,
     },
     AwaitResult {
         request_seq: u64,
         kind: u8,
+        req_id: u64,
         allowed: bool,
         payload_size: Option<u64>,
     },
@@ -79,6 +99,8 @@ fn is_scheduler_kind(kind: u16) -> bool {
             | KIND_PICK_TASK
             | KIND_YIELD
             | KIND_FUEL_DEBIT
+            | KIND_DEADLOCK_DETECTED
+            | KIND_DEADLOCK_EDGE
     )
 }
 
@@ -178,7 +200,25 @@ fn decode_fuel_debit_tick(payload: &[u8]) -> io::Result<u64> {
     Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
 }
 
-fn decode_io_request(payload: &[u8]) -> io::Result<u8> {
+fn decode_io_request(payload: &[u8]) -> io::Result<(u64, u8)> {
+    if payload.len() >= 11 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let maybe_kind = payload[8];
+        let path_len = u16::from_le_bytes(payload[9..11].try_into().unwrap()) as usize;
+        if payload.len() == 11 + path_len
+            && matches!(
+                maybe_kind,
+                IO_KIND_FS_READ
+                    | IO_KIND_FS_WRITE
+                    | IO_KIND_NET_CONNECT
+                    | IO_KIND_NET_SEND
+                    | IO_KIND_NET_RECV
+            )
+        {
+            return Ok((req_id, maybe_kind));
+        }
+    }
+
     if payload.len() < 3 {
         return Err(err_invalid(format!(
             "Bad IoRequest payload len {}",
@@ -195,12 +235,43 @@ fn decode_io_request(payload: &[u8]) -> io::Result<u8> {
     }
     match payload[0] {
         IO_KIND_FS_READ | IO_KIND_FS_WRITE | IO_KIND_NET_CONNECT | IO_KIND_NET_SEND
-        | IO_KIND_NET_RECV => Ok(payload[0]),
+        | IO_KIND_NET_RECV => Ok((0, payload[0])),
         v => Err(err_invalid(format!("invalid IoRequest kind {}", v))),
     }
 }
 
-fn decode_io_decision(payload: &[u8]) -> io::Result<bool> {
+fn decode_io_begin(payload: &[u8]) -> io::Result<u64> {
+    if payload.len() != 8 {
+        return Err(err_invalid(format!(
+            "Bad IoBegin payload len {}",
+            payload.len()
+        )));
+    }
+    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+}
+
+fn decode_io_decision(payload: &[u8]) -> io::Result<(u64, bool, u32)> {
+    if payload.len() == 13 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let allowed = match payload[8] {
+            0 => false,
+            1 => true,
+            v => return Err(err_invalid(format!("invalid IoDecision.allowed {}", v))),
+        };
+        let reason_code = u32::from_le_bytes(payload[9..13].try_into().unwrap());
+        match reason_code {
+            IO_REASON_ALLOWED
+            | IO_REASON_DENIED_MISSING_CAPABILITY
+            | IO_REASON_DENIED_FUEL
+            | IO_REASON_DENIED_POLICY
+            | IO_REASON_DENIED_BACKPRESSURE => {}
+            other => {
+                return Err(err_invalid(format!("invalid IoDecision.reason {}", other)));
+            }
+        }
+        return Ok((req_id, allowed, reason_code));
+    }
+
     if payload.len() != 1 {
         return Err(err_invalid(format!(
             "Bad IoDecision payload len {}",
@@ -208,13 +279,43 @@ fn decode_io_decision(payload: &[u8]) -> io::Result<bool> {
         )));
     }
     match payload[0] {
-        0 => Ok(false),
-        1 => Ok(true),
+        0 => Ok((0, false, IO_REASON_DENIED_POLICY)),
+        1 => Ok((0, true, IO_REASON_ALLOWED)),
         v => Err(err_invalid(format!("invalid IoDecision.allowed {}", v))),
     }
 }
 
-fn decode_io_result(payload: &[u8]) -> io::Result<(bool, u64)> {
+fn decode_io_result(payload: &[u8]) -> io::Result<(u64, bool, u64, Option<u8>)> {
+    if payload.len() == 18 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let success = match payload[8] {
+            0 => false,
+            1 => true,
+            v => return Err(err_invalid(format!("invalid IoResult.success {}", v))),
+        };
+        let size = u64::from_le_bytes(payload[9..17].try_into().unwrap());
+        let code = payload[17];
+        let code_opt = if code == u8::MAX {
+            None
+        } else if (1..=15).contains(&code) {
+            Some(code)
+        } else {
+            return Err(err_invalid(format!("invalid IoResult.code {}", code)));
+        };
+        return Ok((req_id, success, size, code_opt));
+    }
+
+    if payload.len() == 17 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let success = match payload[8] {
+            0 => false,
+            1 => true,
+            v => return Err(err_invalid(format!("invalid IoResult.success {}", v))),
+        };
+        let size = u64::from_le_bytes(payload[9..17].try_into().unwrap());
+        return Ok((req_id, success, size, None));
+    }
+
     if payload.len() != 9 {
         return Err(err_invalid(format!(
             "Bad IoResult payload len {}",
@@ -228,12 +329,28 @@ fn decode_io_result(payload: &[u8]) -> io::Result<(bool, u64)> {
     };
     let size = u64::from_le_bytes(payload[1..9].try_into().unwrap());
     match payload[0] {
-        0 | 1 => Ok((success, size)),
+        0 | 1 => Ok((0, success, size, None)),
         v => Err(err_invalid(format!("invalid IoResult.success {}", v))),
     }
 }
 
-fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, Option<&[u8]>)> {
+fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, u64, Option<&[u8]>)> {
+    if payload.len() >= 25 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let hash64 = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        let size = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+        let has_bytes = payload[24];
+        if has_bytes == 0 && payload.len() == 25 {
+            return Ok((req_id, hash64, size, None));
+        }
+        if has_bytes == 1 && payload.len() >= 29 {
+            let len = u32::from_le_bytes(payload[25..29].try_into().unwrap()) as usize;
+            if payload.len() == 29 + len {
+                return Ok((req_id, hash64, size, Some(&payload[29..])));
+            }
+        }
+    }
+
     if payload.len() < 17 {
         return Err(err_invalid(format!(
             "Bad IoPayload payload len {}",
@@ -252,7 +369,7 @@ fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, Option<&[u8]>)> {
                     payload.len()
                 )));
             }
-            Ok((hash64, size, None))
+            Ok((0, hash64, size, None))
         }
         1 => {
             if payload.len() < 21 {
@@ -269,9 +386,194 @@ fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, Option<&[u8]>)> {
                     payload.len()
                 )));
             }
-            Ok((hash64, size, Some(&payload[21..])))
+            Ok((0, hash64, size, Some(&payload[21..])))
         }
         v => Err(err_invalid(format!("invalid IoPayload.has_bytes {}", v))),
+    }
+}
+
+fn decode_bus_send(payload: &[u8]) -> io::Result<(u64, u32, u32)> {
+    if payload.len() != 30 {
+        return Err(err_invalid(format!(
+            "Bad BusSend payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let sender = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let receiver = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+    Ok((req_id, sender, receiver))
+}
+
+fn decode_bus_recv(payload: &[u8]) -> io::Result<(u64, u32)> {
+    if payload.len() != 12 {
+        return Err(err_invalid(format!(
+            "Bad BusRecv payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let receiver = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    Ok((req_id, receiver))
+}
+
+fn decode_bus_send_request(payload: &[u8]) -> io::Result<(u64, u32, u32)> {
+    if payload.len() != 24 {
+        return Err(err_invalid(format!(
+            "Bad BusSendRequest payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let sender = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let receiver = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+    Ok((req_id, sender, receiver))
+}
+
+fn decode_bus_decision(payload: &[u8]) -> io::Result<(u64, bool)> {
+    if payload.len() != 13 {
+        return Err(err_invalid(format!(
+            "Bad BusDecision payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let allowed = match payload[8] {
+        0 => false,
+        1 => true,
+        v => return Err(err_invalid(format!("invalid BusDecision.allowed {}", v))),
+    };
+    Ok((req_id, allowed))
+}
+
+fn decode_bus_send_result(payload: &[u8]) -> io::Result<(u64, bool)> {
+    if payload.len() != 9 {
+        return Err(err_invalid(format!(
+            "Bad BusSendResult payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let ok = match payload[8] {
+        0 => false,
+        1 => true,
+        v => return Err(err_invalid(format!("invalid BusSendResult.ok {}", v))),
+    };
+    Ok((req_id, ok))
+}
+
+fn decode_channel_created(payload: &[u8]) -> io::Result<(u64, u64, u64, u64)> {
+    if payload.len() != 32 {
+        return Err(err_invalid(format!(
+            "Bad ChannelCreated payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let schema_id = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+    let limits_digest = u64::from_le_bytes(payload[24..32].try_into().unwrap());
+    Ok((req_id, channel_id, schema_id, limits_digest))
+}
+
+fn decode_channel_closed(payload: &[u8]) -> io::Result<(u64, u64)> {
+    if payload.len() != 16 {
+        return Err(err_invalid(format!(
+            "Bad ChannelClosed payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    Ok((req_id, channel_id))
+}
+
+fn decode_message_sent(payload: &[u8]) -> io::Result<(u64, u64, u32, u64, u64, u64, u32)> {
+    if payload.len() != 48 {
+        return Err(err_invalid(format!(
+            "Bad MessageSent payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let sender_id = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+    let sender_seq = u64::from_le_bytes(payload[20..28].try_into().unwrap());
+    let schema_id = u64::from_le_bytes(payload[28..36].try_into().unwrap());
+    let hash64 = u64::from_le_bytes(payload[36..44].try_into().unwrap());
+    let size = u32::from_le_bytes(payload[44..48].try_into().unwrap());
+    Ok((
+        req_id, channel_id, sender_id, sender_seq, schema_id, hash64, size,
+    ))
+}
+
+fn decode_message_delivered(payload: &[u8]) -> io::Result<(u64, u64, u32, u32, u64, u64, u32)> {
+    if payload.len() != 44 {
+        return Err(err_invalid(format!(
+            "Bad MessageDelivered payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let receiver_id = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+    let sender_id = u32::from_le_bytes(payload[20..24].try_into().unwrap());
+    let sender_seq = u64::from_le_bytes(payload[24..32].try_into().unwrap());
+    let hash64 = u64::from_le_bytes(payload[32..40].try_into().unwrap());
+    let size = u32::from_le_bytes(payload[40..44].try_into().unwrap());
+    Ok((
+        req_id,
+        channel_id,
+        receiver_id,
+        sender_id,
+        sender_seq,
+        hash64,
+        size,
+    ))
+}
+
+fn decode_message_blocked(payload: &[u8]) -> io::Result<(u64, u64, u32)> {
+    if payload.len() != 20 {
+        return Err(err_invalid(format!(
+            "Bad MessageBlocked payload len {}",
+            payload.len()
+        )));
+    }
+    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let receiver_id = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+    Ok((req_id, channel_id, receiver_id))
+}
+
+fn decode_deadlock_detected(payload: &[u8]) -> io::Result<(u64, u32, u8)> {
+    if payload.len() != 13 {
+        return Err(err_invalid(format!(
+            "Bad DeadlockDetected payload len {}",
+            payload.len()
+        )));
+    }
+    let tick = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let blocked = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let kind = payload[12];
+    if kind == 0 {
+        return Err(err_invalid("invalid DeadlockDetected.kind 0"));
+    }
+    Ok((tick, blocked, kind))
+}
+
+fn decode_deadlock_edge(payload: &[u8]) -> io::Result<(u32, u32, u8)> {
+    if payload.len() != 9 {
+        return Err(err_invalid(format!(
+            "Bad DeadlockEdge payload len {}",
+            payload.len()
+        )));
+    }
+    let from = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+    let to = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+    let reason = payload[8];
+    match reason {
+        1 | 2 | 3 => Ok((from, to, reason)),
+        v => Err(err_invalid(format!("invalid DeadlockEdge.reason {}", v))),
     }
 }
 
@@ -299,7 +601,7 @@ fn io_kind_name(kind: u8) -> &'static str {
 fn is_io_event_kind(kind: u16) -> bool {
     matches!(
         kind,
-        KIND_IO_REQUEST | KIND_IO_DECISION | KIND_IO_PAYLOAD | KIND_IO_RESULT
+        KIND_IO_BEGIN | KIND_IO_REQUEST | KIND_IO_DECISION | KIND_IO_PAYLOAD | KIND_IO_RESULT
     )
 }
 
@@ -348,9 +650,21 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
     let mut saw_draining_state = false;
     let mut saw_finished_state = false;
     let replay_mode = (header.flags & LOG_FLAG_REPLAY_MODE) != 0;
-    let mut pending_io: Vec<(u64, u8)> = Vec::new();
+    let mut pending_io: Vec<(u64, u8, u64)> = Vec::new();
     let mut pending_io_state: Option<PendingIoState> = None;
+    let mut pending_io_begin_req: Option<u64> = None;
+    let mut io_begin_seen = false;
+    let mut last_io_req_id: Option<u64> = None;
+    let mut bus_send_req: BTreeMap<u64, BusSendReqState> = BTreeMap::new();
+    let mut bus_sent: BTreeMap<u64, (u32, u32, bool)> = BTreeMap::new();
+    let mut bus_pending_by_receiver: BTreeMap<u32, BTreeSet<(u64, u32)>> = BTreeMap::new();
+    let mut channels_open: BTreeSet<u64> = BTreeSet::new();
+    let mut message_sent: BTreeMap<u64, (u64, u32, u64, u64, u32, bool)> = BTreeMap::new();
+    let mut message_pending_by_channel: BTreeMap<u64, BTreeSet<(u32, u64, u64)>> = BTreeMap::new();
     let mut last_io_seq: Option<u64> = None;
+    let mut deadlock_seen: Option<(u64, u32, u8)> = None;
+    let mut deadlock_blocked_edges_seen: u32 = 0;
+    let mut deadlock_last_from: Option<u32> = None;
 
     while let Some(ev) = reader.read_next()? {
         if seen_run_finished {
@@ -575,6 +889,59 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                     let _ = decode_fuel_debit_tick(&ev.payload)?;
                 }
 
+                KIND_DEADLOCK_DETECTED => {
+                    if open_tick.is_some() {
+                        return Err(err_invalid(format!(
+                            "DeadlockDetected emitted with open tick at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    if deadlock_seen.is_some() {
+                        return Err(err_invalid(format!(
+                            "duplicate DeadlockDetected at seq={}",
+                            ev.seq
+                        )));
+                    }
+                    let (tick, blocked, kind) = decode_deadlock_detected(&ev.payload)?;
+                    deadlock_seen = Some((tick, blocked, kind));
+                    deadlock_blocked_edges_seen = 0;
+                    deadlock_last_from = None;
+                }
+
+                KIND_DEADLOCK_EDGE => {
+                    let (from, _to, reason) = decode_deadlock_edge(&ev.payload)?;
+                    let (_tick, blocked, _kind) = deadlock_seen.ok_or_else(|| {
+                        err_invalid(format!(
+                            "DeadlockEdge without DeadlockDetected at seq={}",
+                            ev.seq
+                        ))
+                    })?;
+
+                    if reason == 1 || reason == 2 {
+                        if deadlock_blocked_edges_seen >= blocked {
+                            return Err(err_invalid(format!(
+                                "extra blocked DeadlockEdge beyond blocked_count at seq={}",
+                                ev.seq
+                            )));
+                        }
+                        if let Some(prev_from) = deadlock_last_from {
+                            if from < prev_from {
+                                return Err(err_invalid(format!(
+                                    "DeadlockEdge blocked graph order regressed at seq={}: prev_from={} from={}",
+                                    ev.seq, prev_from, from
+                                )));
+                            }
+                        }
+                        deadlock_last_from = Some(from);
+                        deadlock_blocked_edges_seen = deadlock_blocked_edges_seen.saturating_add(1);
+                    } else if deadlock_blocked_edges_seen < blocked {
+                        return Err(err_invalid(format!(
+                            "Deadlock cycle edges emitted before blocked graph completed at seq={}",
+                            ev.seq
+                        )));
+                    }
+                }
+
                 _ => {}
             }
         }
@@ -764,8 +1131,51 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                 }
             }
 
+            KIND_IO_BEGIN => {
+                if replay_mode {
+                    return Err(err_invalid(format!(
+                        "IoBegin not allowed in replay mode at seq={}",
+                        ev.seq
+                    )));
+                }
+                if pending_io_state.is_some()
+                    || !pending_io.is_empty()
+                    || pending_io_begin_req.is_some()
+                {
+                    return Err(err_invalid(format!(
+                        "IoBegin started before previous IO operation completed at seq={}",
+                        ev.seq
+                    )));
+                }
+                let req_id = decode_io_begin(&ev.payload)?;
+                if req_id == 0 {
+                    return Err(err_invalid(format!(
+                        "IoBegin req_id must be > 0 at seq={}",
+                        ev.seq
+                    )));
+                }
+                match last_io_req_id {
+                    Some(prev) if req_id != prev.saturating_add(1) => {
+                        return Err(err_invalid(format!(
+                            "IoBegin req_id must increase by 1: prev={} current={} at seq={}",
+                            prev, req_id, ev.seq
+                        )));
+                    }
+                    None if req_id != 1 => {
+                        return Err(err_invalid(format!(
+                            "first IoBegin req_id must be 1, got {} at seq={}",
+                            req_id, ev.seq
+                        )));
+                    }
+                    _ => {}
+                }
+                last_io_req_id = Some(req_id);
+                pending_io_begin_req = Some(req_id);
+                io_begin_seen = true;
+            }
+
             KIND_IO_REQUEST => {
-                let kind = decode_io_request(&ev.payload)?;
+                let (request_req_id, kind) = decode_io_request(&ev.payload)?;
                 if replay_mode {
                     return Err(err_invalid(format!(
                         "IoRequest not allowed in replay mode at seq={}",
@@ -778,27 +1188,70 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                         ev.seq
                     )));
                 }
-                pending_io.push((ev.seq, kind));
+                let begin_req_id = pending_io_begin_req.take().unwrap_or(0);
+                if io_begin_seen && begin_req_id == 0 {
+                    return Err(err_invalid(format!(
+                        "IoRequest missing preceding IoBegin at seq={}",
+                        ev.seq
+                    )));
+                }
+                let req_id = if begin_req_id != 0 {
+                    if request_req_id != 0 && request_req_id != begin_req_id {
+                        return Err(err_invalid(format!(
+                            "IoRequest req_id mismatch at seq={}: begin={} request={}",
+                            ev.seq, begin_req_id, request_req_id
+                        )));
+                    }
+                    begin_req_id
+                } else {
+                    request_req_id
+                };
+                pending_io.push((ev.seq, kind, req_id));
                 pending_io_state = Some(PendingIoState::AwaitDecision {
                     request_seq: ev.seq,
                     kind,
+                    req_id,
                 });
             }
 
             KIND_IO_DECISION => {
-                let allowed = decode_io_decision(&ev.payload)?;
+                let (decision_req_id, allowed, reason_code) = decode_io_decision(&ev.payload)?;
                 match pending_io_state {
-                    Some(PendingIoState::AwaitDecision { request_seq, kind }) => {
+                    Some(PendingIoState::AwaitDecision {
+                        request_seq,
+                        kind,
+                        req_id,
+                    }) => {
+                        if req_id != 0 && decision_req_id != 0 && decision_req_id != req_id {
+                            return Err(err_invalid(format!(
+                                "IoDecision req_id mismatch at seq={}: expected {} got {}",
+                                ev.seq, req_id, decision_req_id
+                            )));
+                        }
+                        if allowed && reason_code != IO_REASON_ALLOWED {
+                            return Err(err_invalid(format!(
+                                "IoDecision.allowed=true must use reason Allowed at seq={}",
+                                ev.seq
+                            )));
+                        }
+                        if !allowed && reason_code == IO_REASON_ALLOWED {
+                            return Err(err_invalid(format!(
+                                "IoDecision.allowed=false cannot use reason Allowed at seq={}",
+                                ev.seq
+                            )));
+                        }
                         if allowed {
                             pending_io_state = Some(PendingIoState::AwaitPayload {
                                 request_seq,
                                 kind,
+                                req_id,
                                 allowed,
                             });
                         } else {
                             pending_io_state = Some(PendingIoState::AwaitResult {
                                 request_seq,
                                 kind,
+                                req_id,
                                 allowed,
                                 payload_size: None,
                             });
@@ -826,17 +1279,24 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
             }
 
             KIND_IO_PAYLOAD => {
-                let (hash64, size, bytes) = decode_io_payload(&ev.payload)?;
+                let (payload_req_id, hash64, size, bytes) = decode_io_payload(&ev.payload)?;
                 match pending_io_state {
                     Some(PendingIoState::AwaitPayload {
                         request_seq,
                         kind,
+                        req_id,
                         allowed,
                     }) => {
                         if !allowed {
                             return Err(err_invalid(format!(
                                 "IoPayload after denied IoDecision at seq={}",
                                 ev.seq
+                            )));
+                        }
+                        if req_id != 0 && payload_req_id != 0 && payload_req_id != req_id {
+                            return Err(err_invalid(format!(
+                                "IoPayload req_id mismatch at seq={}: expected {} got {}",
+                                ev.seq, req_id, payload_req_id
                             )));
                         }
                         match kind {
@@ -934,6 +1394,7 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                         pending_io_state = Some(PendingIoState::AwaitResult {
                             request_seq,
                             kind,
+                            req_id,
                             allowed,
                             payload_size: Some(size),
                         });
@@ -960,14 +1421,21 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
             }
 
             KIND_IO_RESULT => {
-                let (success, size) = decode_io_result(&ev.payload)?;
+                let (result_req_id, success, size, code) = decode_io_result(&ev.payload)?;
                 match pending_io_state {
                     Some(PendingIoState::AwaitResult {
                         request_seq,
                         kind,
+                        req_id,
                         allowed,
                         payload_size,
                     }) => {
+                        if req_id != 0 && result_req_id != 0 && result_req_id != req_id {
+                            return Err(err_invalid(format!(
+                                "IoResult req_id mismatch at seq={}: expected {} got {}",
+                                ev.seq, req_id, result_req_id
+                            )));
+                        }
                         if allowed && payload_size.is_none() {
                             return Err(err_invalid(format!(
                                 "IoResult without IoPayload after allowed IoDecision at seq={}",
@@ -979,6 +1447,20 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                                 "IoResult.success=true after denied IoDecision at seq={}",
                                 ev.seq
                             )));
+                        }
+                        if success && code.is_some() {
+                            return Err(err_invalid(format!(
+                                "IoResult.success=true must not carry IoResult.code at seq={}",
+                                ev.seq
+                            )));
+                        }
+                        if !success && code.is_none() {
+                            if req_id != 0 || result_req_id != 0 {
+                                return Err(err_invalid(format!(
+                                    "IoResult.success=false must carry IoResult.code at seq={}",
+                                    ev.seq
+                                )));
+                            }
                         }
                         if let Some(ps) = payload_size {
                             if size != ps {
@@ -1001,16 +1483,17 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                                 )));
                             }
                         }
-                        let (req_seq, req_kind) = pending_io.pop().ok_or_else(|| {
-                            err_invalid(format!(
-                                "IoResult without matching IoRequest at seq={}",
-                                ev.seq
-                            ))
-                        })?;
-                        if req_seq != request_seq || req_kind != kind {
+                        let (req_seq, req_kind, req_id_from_req) =
+                            pending_io.pop().ok_or_else(|| {
+                                err_invalid(format!(
+                                    "IoResult without matching IoRequest at seq={}",
+                                    ev.seq
+                                ))
+                            })?;
+                        if req_seq != request_seq || req_kind != kind || req_id_from_req != req_id {
                             return Err(err_invalid(format!(
-                                "IoResult matched wrong IoRequest at seq={}: request_seq={} result_request_seq={} request_kind={} result_kind={}",
-                                ev.seq, req_seq, request_seq, req_kind, kind
+                                "IoResult matched wrong IoRequest at seq={}: request_seq={} result_request_seq={} request_kind={} result_kind={} request_req_id={} result_req_id={}",
+                                ev.seq, req_seq, request_seq, req_kind, kind, req_id_from_req, req_id
                             )));
                         }
                         pending_io_state = None;
@@ -1034,6 +1517,314 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
                         )));
                     }
                 }
+            }
+
+            KIND_BUS_SEND_REQUEST => {
+                if replay_mode {
+                    return Err(err_invalid(format!(
+                        "BusSendRequest not allowed in replay mode at seq={}",
+                        ev.seq
+                    )));
+                }
+
+                let (req_id, sender, receiver) = decode_bus_send_request(&ev.payload)?;
+                if bus_send_req
+                    .insert(
+                        req_id,
+                        BusSendReqState {
+                            sender,
+                            receiver,
+                            decided: false,
+                            decision_allowed: false,
+                            result_seen: false,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(err_invalid(format!(
+                        "duplicate BusSendRequest req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+            }
+
+            KIND_BUS_DECISION => {
+                let (req_id, allowed) = decode_bus_decision(&ev.payload)?;
+                if req_id == 0 {
+                    continue;
+                }
+
+                let Some(state) = bus_send_req.get_mut(&req_id) else {
+                    return Err(err_invalid(format!(
+                        "BusDecision without matching BusSendRequest: req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                };
+                if state.decided {
+                    return Err(err_invalid(format!(
+                        "duplicate BusDecision for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+
+                state.decided = true;
+                state.decision_allowed = allowed;
+            }
+
+            KIND_BUS_SEND_RESULT => {
+                let (req_id, ok) = decode_bus_send_result(&ev.payload)?;
+                let Some(state) = bus_send_req.get_mut(&req_id) else {
+                    return Err(err_invalid(format!(
+                        "BusSendResult without matching BusSendRequest: req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                };
+
+                if !state.decided {
+                    return Err(err_invalid(format!(
+                        "BusSendResult before BusDecision for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+                if state.result_seen {
+                    return Err(err_invalid(format!(
+                        "duplicate BusSendResult for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+                if ok && !state.decision_allowed {
+                    return Err(err_invalid(format!(
+                        "BusSendResult.ok=true after denied BusDecision for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+
+                state.result_seen = true;
+                if ok {
+                    if bus_sent
+                        .insert(req_id, (state.sender, state.receiver, false))
+                        .is_some()
+                    {
+                        return Err(err_invalid(format!(
+                            "duplicate delivered req_id {} at seq={}",
+                            req_id, ev.seq
+                        )));
+                    }
+                    bus_pending_by_receiver
+                        .entry(state.receiver)
+                        .or_default()
+                        .insert((req_id, state.sender));
+                }
+            }
+
+            KIND_CHANNEL_CREATED => {
+                let (_req_id, channel_id, _schema_id, _limits_digest) =
+                    decode_channel_created(&ev.payload)?;
+                if !channels_open.insert(channel_id) {
+                    return Err(err_invalid(format!(
+                        "duplicate ChannelCreated for channel_id {} at seq={}",
+                        channel_id, ev.seq
+                    )));
+                }
+            }
+
+            KIND_CHANNEL_CLOSED => {
+                let (_req_id, channel_id) = decode_channel_closed(&ev.payload)?;
+                if !channels_open.remove(&channel_id) {
+                    return Err(err_invalid(format!(
+                        "ChannelClosed without open channel_id {} at seq={}",
+                        channel_id, ev.seq
+                    )));
+                }
+            }
+
+            KIND_MESSAGE_SENT => {
+                if replay_mode {
+                    return Err(err_invalid(format!(
+                        "MessageSent not allowed in replay mode at seq={}",
+                        ev.seq
+                    )));
+                }
+                let (req_id, channel_id, sender_id, sender_seq, _schema_id, hash64, size) =
+                    decode_message_sent(&ev.payload)?;
+                if !channels_open.contains(&channel_id) {
+                    return Err(err_invalid(format!(
+                        "MessageSent references non-open channel_id {} at seq={}",
+                        channel_id, ev.seq
+                    )));
+                }
+                if message_sent
+                    .insert(
+                        req_id,
+                        (channel_id, sender_id, sender_seq, hash64, size, false),
+                    )
+                    .is_some()
+                {
+                    return Err(err_invalid(format!(
+                        "duplicate MessageSent req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+                message_pending_by_channel
+                    .entry(channel_id)
+                    .or_default()
+                    .insert((sender_id, sender_seq, req_id));
+            }
+
+            KIND_MESSAGE_DELIVERED => {
+                let (req_id, channel_id, _receiver_id, sender_id, sender_seq, hash64, size) =
+                    decode_message_delivered(&ev.payload)?;
+                let Some((
+                    sent_channel,
+                    sent_sender,
+                    sent_sender_seq,
+                    sent_hash,
+                    sent_size,
+                    delivered,
+                )) = message_sent.get_mut(&req_id)
+                else {
+                    return Err(err_invalid(format!(
+                        "MessageDelivered without MessageSent for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                };
+                if *delivered {
+                    return Err(err_invalid(format!(
+                        "duplicate MessageDelivered for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+                if *sent_channel != channel_id
+                    || *sent_sender != sender_id
+                    || *sent_sender_seq != sender_seq
+                    || *sent_hash != hash64
+                    || *sent_size != size
+                {
+                    return Err(err_invalid(format!(
+                        "MessageDelivered mismatch for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+
+                let Some(pending_for_channel) = message_pending_by_channel.get(&channel_id) else {
+                    return Err(err_invalid(format!(
+                        "MessageDelivered channel {} has no pending messages at seq={}",
+                        channel_id, ev.seq
+                    )));
+                };
+                let expected = pending_for_channel.iter().next().copied().ok_or_else(|| {
+                    err_invalid(format!(
+                        "MessageDelivered channel {} pending set is empty at seq={}",
+                        channel_id, ev.seq
+                    ))
+                })?;
+                if expected != (sender_id, sender_seq, req_id) {
+                    return Err(err_invalid(format!(
+                        "MessageDelivered ordering mismatch at seq={}: expected sender {} seq {} req_id {}, got sender {} seq {} req_id {}",
+                        ev.seq, expected.0, expected.1, expected.2, sender_id, sender_seq, req_id
+                    )));
+                }
+
+                let remove_channel_key =
+                    if let Some(pending_mut) = message_pending_by_channel.get_mut(&channel_id) {
+                        pending_mut.remove(&(sender_id, sender_seq, req_id));
+                        pending_mut.is_empty()
+                    } else {
+                        false
+                    };
+                if remove_channel_key {
+                    message_pending_by_channel.remove(&channel_id);
+                }
+
+                *delivered = true;
+            }
+
+            KIND_MESSAGE_BLOCKED => {
+                let (_req_id, channel_id, _receiver_id) = decode_message_blocked(&ev.payload)?;
+                if !channels_open.contains(&channel_id) {
+                    return Err(err_invalid(format!(
+                        "MessageBlocked references non-open channel_id {} at seq={}",
+                        channel_id, ev.seq
+                    )));
+                }
+            }
+
+            KIND_BUS_SEND => {
+                if replay_mode {
+                    return Err(err_invalid(format!(
+                        "BusSend not allowed in replay mode at seq={}",
+                        ev.seq
+                    )));
+                }
+
+                let (req_id, sender, receiver) = decode_bus_send(&ev.payload)?;
+                if bus_sent.insert(req_id, (sender, receiver, false)).is_some() {
+                    return Err(err_invalid(format!(
+                        "duplicate BusSend req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+
+                bus_pending_by_receiver
+                    .entry(receiver)
+                    .or_default()
+                    .insert((req_id, sender));
+            }
+
+            KIND_BUS_RECV => {
+                let (req_id, receiver) = decode_bus_recv(&ev.payload)?;
+                let Some((sender, expected_receiver, delivered)) = bus_sent.get_mut(&req_id) else {
+                    return Err(err_invalid(format!(
+                        "BusRecv delivery mismatch: no matching successful send for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                };
+
+                if *expected_receiver != receiver {
+                    return Err(err_invalid(format!(
+                        "BusRecv receiver mismatch for req_id {} at seq={}: expected {}, got {}",
+                        req_id, ev.seq, *expected_receiver, receiver
+                    )));
+                }
+                if *delivered {
+                    return Err(err_invalid(format!(
+                        "duplicate BusRecv for req_id {} at seq={}",
+                        req_id, ev.seq
+                    )));
+                }
+
+                let Some(pending_for_receiver) = bus_pending_by_receiver.get(&receiver) else {
+                    return Err(err_invalid(format!(
+                        "BusRecv delivery mismatch: receiver {} has no pending sends at seq={}",
+                        receiver, ev.seq
+                    )));
+                };
+                let expected = pending_for_receiver.iter().next().copied().ok_or_else(|| {
+                    err_invalid(format!(
+                        "BusRecv delivery mismatch: receiver {} has empty pending set at seq={}",
+                        receiver, ev.seq
+                    ))
+                })?;
+
+                if expected != (req_id, *sender) {
+                    return Err(err_invalid(format!(
+                        "BusRecv delivery mismatch at seq={}: expected req_id {} sender {} for receiver {}, got req_id {} sender {}",
+                        ev.seq, expected.0, expected.1, receiver, req_id, *sender
+                    )));
+                }
+
+                let remove_receiver_key =
+                    if let Some(pending_mut) = bus_pending_by_receiver.get_mut(&receiver) {
+                        pending_mut.remove(&(req_id, *sender));
+                        pending_mut.is_empty()
+                    } else {
+                        false
+                    };
+                if remove_receiver_key {
+                    bus_pending_by_receiver.remove(&receiver);
+                }
+
+                *delivered = true;
             }
 
             _ => {}
@@ -1079,10 +1870,34 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
         return Err(err_invalid("missing RunFinished record"));
     }
 
-    if pending_io_state.is_some() || !pending_io.is_empty() {
+    if pending_io_state.is_some() || !pending_io.is_empty() || pending_io_begin_req.is_some() {
         return Err(err_invalid(
             "log ended with incomplete IO operation (missing IoDecision, IoPayload, or IoResult)",
         ));
+    }
+
+    for (req_id, st) in &bus_send_req {
+        if !st.decided {
+            return Err(err_invalid(format!(
+                "log ended with incomplete BusSendRequest {} (missing BusDecision)",
+                req_id
+            )));
+        }
+        if !st.result_seen {
+            return Err(err_invalid(format!(
+                "log ended with incomplete BusSendRequest {} (missing BusSendResult)",
+                req_id
+            )));
+        }
+    }
+
+    if let Some((_tick, blocked, _kind)) = deadlock_seen {
+        if deadlock_blocked_edges_seen != blocked {
+            return Err(err_invalid(format!(
+                "DeadlockDetected blocked_count mismatch: expected {} blocked edges, saw {}",
+                blocked, deadlock_blocked_edges_seen
+            )));
+        }
     }
 
     if scheduler_events_seen {
@@ -1135,6 +1950,18 @@ pub fn verify_log<P: AsRef<Path>>(path: P) -> io::Result<ReplayResult> {
         }
     }
 
+    if exit_code == Some(COOP_EXIT_DEADLOCK) && deadlock_seen.is_none() {
+        return Err(err_invalid(
+            "RunFinished exit_code=75 but DeadlockDetected was not emitted",
+        ));
+    }
+    if exit_code != Some(COOP_EXIT_DEADLOCK) && deadlock_seen.is_some() {
+        return Err(err_invalid(format!(
+            "DeadlockDetected present but RunFinished exit_code={} (expected 75)",
+            exit_code.unwrap_or(1)
+        )));
+    }
+
     let computed = hasher.finalize();
     let mut computed_arr = [0u8; 32];
     computed_arr.copy_from_slice(&computed[..]);
@@ -1165,6 +1992,8 @@ mod tests {
     use super::*;
     use crate::runtime::crc32::crc32_ieee;
     use crate::runtime::event_reader::{
+        KIND_BUS_DECISION, KIND_BUS_RECV, KIND_BUS_SEND, KIND_BUS_SEND_REQUEST,
+        KIND_BUS_SEND_RESULT, KIND_DEADLOCK_DETECTED, KIND_DEADLOCK_EDGE, KIND_IO_BEGIN,
         KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT, KIND_RUN_FINISHED,
         KIND_SCHED_INIT, KIND_SCHED_STATE, KIND_TASK_FINISHED, KIND_TASK_STARTED, KIND_TICK_END,
         KIND_TICK_START, LOG_HEADER_LEN, LOG_MAGIC, LOG_VERSION,
@@ -1346,6 +2175,49 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("IoDecision expected after IoRequest"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn negative_io_begin_req_id_non_monotonic_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(1, 0, KIND_IO_BEGIN, &io_begin_payload(1)),
+            record(
+                2,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(3, 0, KIND_IO_DECISION, &io_decision_payload(true)),
+            record(
+                4,
+                0,
+                KIND_IO_PAYLOAD,
+                &io_payload_payload(fnv1a64(b"abc"), 3, Some(b"abc")),
+            ),
+            record(5, 0, KIND_IO_RESULT, &io_result_payload(true, 3)),
+            record(6, 0, KIND_IO_BEGIN, &io_begin_payload(3)),
+            record(
+                7,
+                0,
+                KIND_IO_REQUEST,
+                &io_request_payload(1, "/tmp/fixture.txt"),
+            ),
+            record(8, 0, KIND_IO_DECISION, &io_decision_payload(false)),
+            record(9, 0, KIND_IO_RESULT, &io_result_payload(false, 0)),
+            record(10, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 11);
+        let path = write_temp_log("neg_io_begin_req_id_non_monotonic", &bytes);
+
+        let err = verify_log(&path).expect_err("expected IoBegin req_id monotonicity failure");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IoBegin req_id must increase by 1"),
             "unexpected verifier error: {}",
             msg
         );
@@ -1546,6 +2418,138 @@ mod tests {
         );
     }
 
+    #[test]
+    fn replay_mode_rejects_new_send() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_BUS_SEND_REQUEST,
+                &bus_send_request_payload(77, 1, 42, 0, 0),
+            ),
+            record(2, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log_with_flags(records, 0, 3, super::LOG_FLAG_REPLAY_MODE);
+        let path = write_temp_log("replay_mode_rejects_new_send", &bytes);
+
+        let err = verify_log(&path).expect_err("expected replay-mode bus send rejection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BusSendRequest not allowed in replay mode"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn replay_mode_recv_mismatch_fails() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(1, 0, KIND_BUS_RECV, &bus_recv_payload(77, 42)),
+            record(2, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log_with_flags(records, 0, 3, super::LOG_FLAG_REPLAY_MODE);
+        let path = write_temp_log("replay_mode_recv_mismatch_fails", &bytes);
+
+        let err = verify_log(&path).expect_err("expected replay-mode bus recv rejection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BusRecv delivery mismatch"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn bus_recv_non_canonical_order_rejected() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(
+                1,
+                0,
+                KIND_BUS_SEND_REQUEST,
+                &bus_send_request_payload(1, 2, 42, 0, 0),
+            ),
+            record(2, 0, KIND_BUS_DECISION, &bus_decision_payload(1, true, 0)),
+            record(
+                3,
+                0,
+                KIND_BUS_SEND_RESULT,
+                &bus_send_result_payload(1, true),
+            ),
+            record(
+                4,
+                0,
+                KIND_BUS_SEND_REQUEST,
+                &bus_send_request_payload(2, 1, 42, 0, 0),
+            ),
+            record(5, 0, KIND_BUS_DECISION, &bus_decision_payload(2, true, 0)),
+            record(
+                6,
+                0,
+                KIND_BUS_SEND_RESULT,
+                &bus_send_result_payload(2, true),
+            ),
+            record(7, 0, KIND_BUS_RECV, &bus_recv_payload(2, 42)),
+            record(8, 0, KIND_TASK_FINISHED, &0i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 0, 9);
+        let path = write_temp_log("bus_recv_non_canonical_order_rejected", &bytes);
+
+        let err = verify_log(&path).expect_err("expected canonical bus order rejection");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("BusRecv delivery mismatch"),
+            "unexpected verifier error: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn deadlock_log_includes_deadlock_detected_before_run_finished() {
+        let records = vec![
+            record(0, 0, KIND_TASK_STARTED, &[]),
+            record(1, 0, KIND_SCHED_INIT, &sched_init_payload(0)),
+            record(
+                2,
+                0,
+                KIND_SCHED_STATE,
+                &sched_state_payload(SchedState::Init, SchedState::Running, 0),
+            ),
+            record(
+                3,
+                0,
+                KIND_DEADLOCK_DETECTED,
+                &deadlock_detected_payload(7, 2, 1),
+            ),
+            record(4, 0, KIND_DEADLOCK_EDGE, &deadlock_edge_payload(0, 1, 1)),
+            record(5, 0, KIND_DEADLOCK_EDGE, &deadlock_edge_payload(1, 9, 2)),
+            record(
+                6,
+                0,
+                KIND_SCHED_STATE,
+                &sched_state_payload(SchedState::Running, SchedState::Draining, 7),
+            ),
+            record(
+                7,
+                0,
+                KIND_SCHED_STATE,
+                &sched_state_payload(SchedState::Draining, SchedState::Finished, 7),
+            ),
+            record(8, 0, KIND_TASK_FINISHED, &75i32.to_le_bytes()),
+        ];
+
+        let bytes = finalize_log(records, 75, 9);
+        let path = write_temp_log("deadlock_event_before_run_finished", &bytes);
+
+        let result = verify_log(&path).expect("deadlock log should verify");
+        assert_eq!(result.exit_code, 75);
+    }
+
     fn base_records() -> Vec<Vec<u8>> {
         vec![
             record(0, 0, KIND_TASK_STARTED, &[]),
@@ -1654,6 +2658,10 @@ mod tests {
         p
     }
 
+    fn io_begin_payload(req_id: u64) -> Vec<u8> {
+        req_id.to_le_bytes().to_vec()
+    }
+
     fn io_decision_payload(allowed: bool) -> Vec<u8> {
         vec![if allowed { 1 } else { 0 }]
     }
@@ -1677,6 +2685,71 @@ mod tests {
             }
             None => p.push(0),
         }
+        p
+    }
+
+    fn bus_send_request_payload(
+        req_id: u64,
+        sender: u32,
+        receiver: u32,
+        schema_id: u32,
+        bytes: u32,
+    ) -> Vec<u8> {
+        let mut p = Vec::with_capacity(24);
+        p.extend_from_slice(&req_id.to_le_bytes());
+        p.extend_from_slice(&sender.to_le_bytes());
+        p.extend_from_slice(&receiver.to_le_bytes());
+        p.extend_from_slice(&schema_id.to_le_bytes());
+        p.extend_from_slice(&bytes.to_le_bytes());
+        p
+    }
+
+    fn bus_decision_payload(req_id: u64, allowed: bool, reason_code: u32) -> Vec<u8> {
+        let mut p = Vec::with_capacity(13);
+        p.extend_from_slice(&req_id.to_le_bytes());
+        p.push(if allowed { 1 } else { 0 });
+        p.extend_from_slice(&reason_code.to_le_bytes());
+        p
+    }
+
+    fn bus_send_result_payload(req_id: u64, ok: bool) -> Vec<u8> {
+        let mut p = Vec::with_capacity(9);
+        p.extend_from_slice(&req_id.to_le_bytes());
+        p.push(if ok { 1 } else { 0 });
+        p
+    }
+
+    fn bus_recv_payload(req_id: u64, receiver: u32) -> Vec<u8> {
+        let mut p = Vec::with_capacity(12);
+        p.extend_from_slice(&req_id.to_le_bytes());
+        p.extend_from_slice(&receiver.to_le_bytes());
+        p
+    }
+
+    fn deadlock_detected_payload(tick: u64, blocked: u32, kind: u8) -> Vec<u8> {
+        let mut p = Vec::with_capacity(13);
+        p.extend_from_slice(&tick.to_le_bytes());
+        p.extend_from_slice(&blocked.to_le_bytes());
+        p.push(kind);
+        p
+    }
+
+    fn deadlock_edge_payload(from: u32, to: u32, reason: u8) -> Vec<u8> {
+        let mut p = Vec::with_capacity(9);
+        p.extend_from_slice(&from.to_le_bytes());
+        p.extend_from_slice(&to.to_le_bytes());
+        p.push(reason);
+        p
+    }
+
+    fn bus_send_payload(req_id: u64, sender: u32, receiver: u32, kind: u16) -> Vec<u8> {
+        let mut p = Vec::with_capacity(30);
+        p.extend_from_slice(&req_id.to_le_bytes());
+        p.extend_from_slice(&sender.to_le_bytes());
+        p.extend_from_slice(&receiver.to_le_bytes());
+        p.extend_from_slice(&kind.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&0u64.to_le_bytes());
         p
     }
 

@@ -104,7 +104,7 @@ fn digest_detail(detail: &str) -> [u8; 32] {
 
 /// Deterministically derive (cap_kind, cap_id, args_digest) from (capability, target).
 ///
-/// - cap_kind: stable enum (FsRead / NetListen).
+/// - cap_kind: stable enum (FsRead / NetListen / BusSend / BusRecv).
 /// - cap_id: derived from args_digest low 4 bytes (LE).
 /// - args_digest: SHA-256 over: b"cap\0" + capability + b"\0" + target
 #[inline]
@@ -113,6 +113,10 @@ fn digest_capability(capability: &str, target: &str) -> (CapabilityKind, u32, [u
         CapabilityKind::FsRead
     } else if capability.starts_with("net.listen") {
         CapabilityKind::NetListen
+    } else if capability.starts_with("bus.send") {
+        CapabilityKind::BusSend
+    } else if capability.starts_with("bus.recv") {
+        CapabilityKind::BusRecv
     } else {
         // Deterministic fallback: pick FsRead (do NOT invent new enum variants).
         CapabilityKind::FsRead

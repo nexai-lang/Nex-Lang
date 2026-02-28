@@ -15,10 +15,12 @@ use sha2::{Digest, Sha256};
 
 use super::crc32::crc32_ieee;
 use super::event::{
-    BusRecv, BusSend, CapabilityInvoked, EncodeLE, EventHeader, EventKind, FuelDebit, FuelReason,
-    IoDecision, IoPayload, IoRequest, IoResult, PickTask, ResourceViolation, RunFinished,
-    SchedInit, SchedState, SchedStatePayload, TaskCancelled, TaskFinished, TaskJoined, TaskSpawned,
-    TaskStarted, TickEnd, TickStart, YieldKind, YieldPayload, EVENT_MAGIC, EVENT_VERSION,
+    BusDecision, BusRecv, BusSend, BusSendRequest, BusSendResult, CapabilityInvoked, ChannelClosed,
+    ChannelCreated, DeadlockDetected, DeadlockEdge, EncodeLE, EventHeader, EventKind, FuelDebit,
+    FuelReason, IoBegin, IoDecision, IoPayload, IoRequest, IoResult, MessageBlocked,
+    MessageDelivered, MessageSent, PickTask, ResourceViolation, RunFinished, SchedInit, SchedState,
+    SchedStatePayload, TaskCancelled, TaskFinished, TaskJoined, TaskSpawned, TaskStarted, TickEnd,
+    TickStart, YieldKind, YieldPayload, EVENT_MAGIC, EVENT_VERSION,
 };
 use super::event_sink::EventSink;
 use super::io_proxy::IoKind;
@@ -284,6 +286,11 @@ impl EventRecorder {
         self.record_event(task, EventKind::FuelDebit, &payload)
     }
 
+    pub fn record_io_begin(&mut self, task: u64, req_id: u64) -> io::Result<u64> {
+        let payload = IoBegin { req_id }.to_bytes_le();
+        self.record_event(task, EventKind::IoBegin, &payload)
+    }
+
     pub fn record_io_request(&mut self, task: u64, kind: IoKind, path: &str) -> io::Result<u64> {
         let payload = IoRequest {
             kind,
@@ -293,13 +300,60 @@ impl EventRecorder {
         self.record_event(task, EventKind::IoRequest, &payload)
     }
 
+    pub fn record_io_request_with_req(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        kind: IoKind,
+        path: &str,
+    ) -> io::Result<u64> {
+        let path_bytes = path.as_bytes();
+        let path_len = path_bytes.len().min(u16::MAX as usize) as u16;
+        let mut payload = Vec::with_capacity(8 + 1 + 2 + path_len as usize);
+        payload.extend_from_slice(&req_id.to_le_bytes());
+        payload.push(kind.as_u8());
+        payload.extend_from_slice(&path_len.to_le_bytes());
+        payload.extend_from_slice(&path_bytes[..path_len as usize]);
+        self.record_event(task, EventKind::IoRequest, &payload)
+    }
+
     pub fn record_io_decision(&mut self, task: u64, allowed: bool) -> io::Result<u64> {
         let payload = IoDecision { allowed }.to_bytes_le();
         self.record_event(task, EventKind::IoDecision, &payload)
     }
 
+    pub fn record_io_decision_with_reason(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        allowed: bool,
+        reason_code: u32,
+    ) -> io::Result<u64> {
+        let mut payload = Vec::with_capacity(13);
+        payload.extend_from_slice(&req_id.to_le_bytes());
+        payload.push(if allowed { 1 } else { 0 });
+        payload.extend_from_slice(&reason_code.to_le_bytes());
+        self.record_event(task, EventKind::IoDecision, &payload)
+    }
+
     pub fn record_io_result(&mut self, task: u64, success: bool, size: u64) -> io::Result<u64> {
         let payload = IoResult { success, size }.to_bytes_le();
+        self.record_event(task, EventKind::IoResult, &payload)
+    }
+
+    pub fn record_io_result_with_req(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        success: bool,
+        size: u64,
+        code: Option<u8>,
+    ) -> io::Result<u64> {
+        let mut payload = Vec::with_capacity(18);
+        payload.extend_from_slice(&req_id.to_le_bytes());
+        payload.push(if success { 1 } else { 0 });
+        payload.extend_from_slice(&size.to_le_bytes());
+        payload.push(code.unwrap_or(u8::MAX));
         self.record_event(task, EventKind::IoResult, &payload)
     }
 
@@ -316,6 +370,30 @@ impl EventRecorder {
             bytes: bytes.map(|b| b.to_vec()),
         }
         .to_bytes_le();
+        self.record_event(task, EventKind::IoPayload, &payload)
+    }
+
+    pub fn record_io_payload_with_req(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        hash64: u64,
+        size: u64,
+        bytes: Option<&[u8]>,
+    ) -> io::Result<u64> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&req_id.to_le_bytes());
+        payload.extend_from_slice(&hash64.to_le_bytes());
+        payload.extend_from_slice(&size.to_le_bytes());
+        match bytes {
+            Some(b) => {
+                let len_u32 = u32::try_from(b.len()).unwrap_or(u32::MAX);
+                payload.push(1);
+                payload.extend_from_slice(&len_u32.to_le_bytes());
+                payload.extend_from_slice(&b[..len_u32 as usize]);
+            }
+            None => payload.push(0),
+        }
         self.record_event(task, EventKind::IoPayload, &payload)
     }
 
@@ -344,6 +422,166 @@ impl EventRecorder {
     pub fn record_bus_recv(&mut self, task: u64, req_id: u64, receiver: u32) -> io::Result<u64> {
         let payload = BusRecv { req_id, receiver }.to_bytes_le();
         self.record_event(task, EventKind::BusRecv, &payload)
+    }
+
+    pub fn record_bus_send_request(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        sender: u32,
+        receiver: u32,
+        schema_id: u32,
+        bytes: u32,
+    ) -> io::Result<u64> {
+        let payload = BusSendRequest {
+            req_id,
+            sender,
+            receiver,
+            schema_id,
+            bytes,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::BusSendRequest, &payload)
+    }
+
+    pub fn record_bus_decision(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        allowed: bool,
+        reason_code: u32,
+    ) -> io::Result<u64> {
+        let payload = BusDecision {
+            req_id,
+            allowed,
+            reason_code,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::BusDecision, &payload)
+    }
+
+    pub fn record_bus_send_result(&mut self, task: u64, req_id: u64, ok: bool) -> io::Result<u64> {
+        let payload = BusSendResult { req_id, ok }.to_bytes_le();
+        self.record_event(task, EventKind::BusSendResult, &payload)
+    }
+
+    pub fn record_channel_created(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        channel_id: u64,
+        schema_id: u64,
+        limits_digest: u64,
+    ) -> io::Result<u64> {
+        let payload = ChannelCreated {
+            req_id,
+            channel_id,
+            schema_id,
+            limits_digest,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::ChannelCreated, &payload)
+    }
+
+    pub fn record_channel_closed(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        channel_id: u64,
+    ) -> io::Result<u64> {
+        let payload = ChannelClosed { req_id, channel_id }.to_bytes_le();
+        self.record_event(task, EventKind::ChannelClosed, &payload)
+    }
+
+    pub fn record_message_sent(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        channel_id: u64,
+        sender_id: u32,
+        sender_seq: u64,
+        schema_id: u64,
+        hash64: u64,
+        size: u32,
+    ) -> io::Result<u64> {
+        let payload = MessageSent {
+            req_id,
+            channel_id,
+            sender_id,
+            sender_seq,
+            schema_id,
+            hash64,
+            size,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::MessageSent, &payload)
+    }
+
+    pub fn record_message_delivered(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        channel_id: u64,
+        receiver_id: u32,
+        sender_id: u32,
+        sender_seq: u64,
+        hash64: u64,
+        size: u32,
+    ) -> io::Result<u64> {
+        let payload = MessageDelivered {
+            req_id,
+            channel_id,
+            receiver_id,
+            sender_id,
+            sender_seq,
+            hash64,
+            size,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::MessageDelivered, &payload)
+    }
+
+    pub fn record_message_blocked(
+        &mut self,
+        task: u64,
+        req_id: u64,
+        channel_id: u64,
+        receiver_id: u32,
+    ) -> io::Result<u64> {
+        let payload = MessageBlocked {
+            req_id,
+            channel_id,
+            receiver_id,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::MessageBlocked, &payload)
+    }
+
+    pub fn record_deadlock_detected(
+        &mut self,
+        task: u64,
+        tick: u64,
+        blocked: u32,
+        kind: u8,
+    ) -> io::Result<u64> {
+        let payload = DeadlockDetected {
+            tick,
+            blocked,
+            kind,
+        }
+        .to_bytes_le();
+        self.record_event(task, EventKind::DeadlockDetected, &payload)
+    }
+
+    pub fn record_deadlock_edge(
+        &mut self,
+        task: u64,
+        from: u32,
+        to: u32,
+        reason: u8,
+    ) -> io::Result<u64> {
+        let payload = DeadlockEdge { from, to, reason }.to_bytes_le();
+        self.record_event(task, EventKind::DeadlockEdge, &payload)
     }
 
     pub fn record_capability_invoked(

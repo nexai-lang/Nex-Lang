@@ -51,6 +51,17 @@ pub enum EventKind {
     IoPayload = 20,
     BusSend = 21,
     BusRecv = 22,
+    BusSendRequest = 23,
+    BusDecision = 24,
+    BusSendResult = 25,
+    DeadlockDetected = 26,
+    DeadlockEdge = 27,
+    IoBegin = 28,
+    MessageSent = 29,
+    MessageDelivered = 30,
+    MessageBlocked = 31,
+    ChannelCreated = 32,
+    ChannelClosed = 33,
 
     // ---- run framing ----
     RunStarted = 0xFFFE,
@@ -89,6 +100,17 @@ impl fmt::Display for EventKind {
             EventKind::IoPayload => "IoPayload",
             EventKind::BusSend => "BusSend",
             EventKind::BusRecv => "BusRecv",
+            EventKind::BusSendRequest => "BusSendRequest",
+            EventKind::BusDecision => "BusDecision",
+            EventKind::BusSendResult => "BusSendResult",
+            EventKind::DeadlockDetected => "DeadlockDetected",
+            EventKind::DeadlockEdge => "DeadlockEdge",
+            EventKind::IoBegin => "IoBegin",
+            EventKind::MessageSent => "MessageSent",
+            EventKind::MessageDelivered => "MessageDelivered",
+            EventKind::MessageBlocked => "MessageBlocked",
+            EventKind::ChannelCreated => "ChannelCreated",
+            EventKind::ChannelClosed => "ChannelClosed",
         };
         f.write_str(s)
     }
@@ -167,6 +189,8 @@ impl EncodeLE for TaskSpawned {
 pub enum CapabilityKind {
     FsRead = 1,
     NetListen = 2,
+    BusSend = 3,
+    BusRecv = 4,
 }
 
 impl CapabilityKind {
@@ -352,6 +376,7 @@ pub enum YieldKind {
     JoinBlocked = 1,
     CancelBlocked = 2,
     FuelExhausted = 3,
+    RecvBlocked = 4,
 }
 
 impl YieldKind {
@@ -367,6 +392,7 @@ impl YieldKind {
             1 => Some(Self::JoinBlocked),
             2 => Some(Self::CancelBlocked),
             3 => Some(Self::FuelExhausted),
+            4 => Some(Self::RecvBlocked),
             _ => None,
         }
     }
@@ -545,6 +571,23 @@ impl EncodeLE for FuelDebit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoBegin {
+    pub req_id: u64,
+}
+
+impl EncodeLE for IoBegin {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IoRequest {
     pub kind: IoKind,
@@ -683,5 +726,233 @@ impl EncodeLE for BusRecv {
     fn encode_le(&self, dst: &mut Vec<u8>) {
         dst.extend_from_slice(&self.req_id.to_le_bytes());
         dst.extend_from_slice(&self.receiver.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusSendRequest {
+    pub req_id: u64,
+    pub sender: u32,
+    pub receiver: u32,
+    pub schema_id: u32,
+    pub bytes: u32,
+}
+
+impl EncodeLE for BusSendRequest {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 4 + 4 + 4 + 4
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.sender.to_le_bytes());
+        dst.extend_from_slice(&self.receiver.to_le_bytes());
+        dst.extend_from_slice(&self.schema_id.to_le_bytes());
+        dst.extend_from_slice(&self.bytes.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusDecision {
+    pub req_id: u64,
+    pub allowed: bool,
+    pub reason_code: u32,
+}
+
+impl EncodeLE for BusDecision {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 1 + 4
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.push(if self.allowed { 1 } else { 0 });
+        dst.extend_from_slice(&self.reason_code.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BusSendResult {
+    pub req_id: u64,
+    pub ok: bool,
+}
+
+impl EncodeLE for BusSendResult {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 1
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.push(if self.ok { 1 } else { 0 });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelCreated {
+    pub req_id: u64,
+    pub channel_id: u64,
+    pub schema_id: u64,
+    pub limits_digest: u64,
+}
+
+impl EncodeLE for ChannelCreated {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 8 + 8 + 8
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.channel_id.to_le_bytes());
+        dst.extend_from_slice(&self.schema_id.to_le_bytes());
+        dst.extend_from_slice(&self.limits_digest.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelClosed {
+    pub req_id: u64,
+    pub channel_id: u64,
+}
+
+impl EncodeLE for ChannelClosed {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 8
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.channel_id.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageSent {
+    pub req_id: u64,
+    pub channel_id: u64,
+    pub sender_id: u32,
+    pub sender_seq: u64,
+    pub schema_id: u64,
+    pub hash64: u64,
+    pub size: u32,
+}
+
+impl EncodeLE for MessageSent {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 8 + 4 + 8 + 8 + 8 + 4
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.channel_id.to_le_bytes());
+        dst.extend_from_slice(&self.sender_id.to_le_bytes());
+        dst.extend_from_slice(&self.sender_seq.to_le_bytes());
+        dst.extend_from_slice(&self.schema_id.to_le_bytes());
+        dst.extend_from_slice(&self.hash64.to_le_bytes());
+        dst.extend_from_slice(&self.size.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageDelivered {
+    pub req_id: u64,
+    pub channel_id: u64,
+    pub receiver_id: u32,
+    pub sender_id: u32,
+    pub sender_seq: u64,
+    pub hash64: u64,
+    pub size: u32,
+}
+
+impl EncodeLE for MessageDelivered {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 8 + 4 + 4 + 8 + 8 + 4
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.channel_id.to_le_bytes());
+        dst.extend_from_slice(&self.receiver_id.to_le_bytes());
+        dst.extend_from_slice(&self.sender_id.to_le_bytes());
+        dst.extend_from_slice(&self.sender_seq.to_le_bytes());
+        dst.extend_from_slice(&self.hash64.to_le_bytes());
+        dst.extend_from_slice(&self.size.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MessageBlocked {
+    pub req_id: u64,
+    pub channel_id: u64,
+    pub receiver_id: u32,
+}
+
+impl EncodeLE for MessageBlocked {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 8 + 4
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.req_id.to_le_bytes());
+        dst.extend_from_slice(&self.channel_id.to_le_bytes());
+        dst.extend_from_slice(&self.receiver_id.to_le_bytes());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadlockDetected {
+    pub tick: u64,
+    pub blocked: u32,
+    pub kind: u8,
+}
+
+impl EncodeLE for DeadlockDetected {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        8 + 4 + 1
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.tick.to_le_bytes());
+        dst.extend_from_slice(&self.blocked.to_le_bytes());
+        dst.push(self.kind);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadlockEdge {
+    pub from: u32,
+    pub to: u32,
+    pub reason: u8,
+}
+
+impl EncodeLE for DeadlockEdge {
+    #[inline]
+    fn encoded_len(&self) -> usize {
+        4 + 4 + 1
+    }
+
+    #[inline]
+    fn encode_le(&self, dst: &mut Vec<u8>) {
+        dst.extend_from_slice(&self.from.to_le_bytes());
+        dst.extend_from_slice(&self.to.to_le_bytes());
+        dst.push(self.reason);
     }
 }

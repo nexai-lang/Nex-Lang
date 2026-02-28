@@ -186,39 +186,76 @@ fn generate_main(
     s.push_str(
         "    fn bus_send(&self, sender: u32, receiver: u32, seq: u64, kind: u16) -> u64 {\n",
     );
-    s.push_str("        let req_id = {\n");
+    s.push_str("        let outcome = {\n");
     s.push_str("            let mut mailbox = self.mailbox.lock().unwrap();\n");
     s.push_str("            mailbox.send(\n");
     s.push_str("                sender,\n");
     s.push_str("                receiver,\n");
     s.push_str("                Message {\n");
     s.push_str("                    req_id: 0,\n");
+    s.push_str("                    channel_id: 0,\n");
     s.push_str("                    sender,\n");
+    s.push_str("                    sender_seq: seq,\n");
     s.push_str("                    seq,\n");
     s.push_str("                    kind,\n");
+    s.push_str("                    schema_id: 0,\n");
+    s.push_str("                    payload: Vec::new(),\n");
     s.push_str("                },\n");
     s.push_str("            )\n");
     s.push_str("        };\n");
     s.push_str("\n");
     s.push_str("        if let Ok(mut rec) = recorder().lock() {\n");
     s.push_str(
-        "            let _ = rec.record_bus_send(0, req_id, sender, receiver, kind, 0, 0);\n",
+        "            let _ = rec.record_bus_send_request(0, outcome.req_id, sender, receiver, 0, outcome.bytes);\n",
     );
+    s.push_str(
+        "            let _ = rec.record_bus_decision(0, outcome.req_id, outcome.allowed, outcome.reason_code);\n",
+    );
+    s.push_str("            if outcome.fuel_cost > 0 {\n");
+    s.push_str(
+        "                let _ = rec.record_fuel_debit(0, 0, 0, outcome.fuel_cost, runtime::event::FuelReason::ProxyCall);\n",
+    );
+    s.push_str("            }\n");
+    s.push_str("            let _ = rec.record_bus_send_result(0, outcome.req_id, outcome.ok);\n");
+    s.push_str("            if outcome.ok {\n");
+    s.push_str(
+        "                let _ = rec.record_bus_send(0, outcome.req_id, sender, receiver, kind, 0, 0);\n",
+    );
+    s.push_str("            }\n");
     s.push_str("        }\n");
     s.push_str("\n");
-    s.push_str("        req_id\n");
+    s.push_str("        if outcome.ok && COOP_MODE {\n");
+    s.push_str("            let _ = self.backend_wake_recv_waiters(receiver);\n");
+    s.push_str("        }\n");
+    s.push_str("\n");
+    s.push_str("        outcome.req_id\n");
     s.push_str("    }\n\n");
 
-    s.push_str("    fn bus_recv(&self, receiver: u32) -> Option<Message> {\n");
-    s.push_str("        let msg = {\n");
+    s.push_str("    fn bus_recv(&self, task: u64, receiver: u32) -> Option<Message> {\n");
+    s.push_str("        let outcome = {\n");
     s.push_str("            let mut mailbox = self.mailbox.lock().unwrap();\n");
     s.push_str("            mailbox.recv(receiver)\n");
     s.push_str("        };\n");
+    s.push_str("\n");
+    s.push_str("        if !outcome.allowed {\n");
+    s.push_str("            if let Ok(mut rec) = recorder().lock() {\n");
+    s.push_str(
+        "                let _ = rec.record_bus_decision(0, 0, false, outcome.reason_code);\n",
+    );
+    s.push_str("            }\n");
+    s.push_str("            return None;\n");
+    s.push_str("        }\n");
+    s.push_str("\n");
+    s.push_str("        let msg = outcome.message;\n");
     s.push_str("\n");
     s.push_str("        if let Some(m) = msg.as_ref() {\n");
     s.push_str("            if let Ok(mut rec) = recorder().lock() {\n");
     s.push_str("                let _ = rec.record_bus_recv(0, m.req_id, receiver);\n");
     s.push_str("            }\n");
+    s.push_str("        }\n");
+    s.push_str("\n");
+    s.push_str("        if msg.is_none() && COOP_MODE {\n");
+    s.push_str("            self.backend_block_on_recv(task, receiver);\n");
     s.push_str("        }\n");
     s.push_str("\n");
     s.push_str("        msg\n");
@@ -232,6 +269,16 @@ fn generate_main(
     s.push_str("    fn backend_request_join(&self, waiter: u64, target: u64) {\n");
     s.push_str("        let mut backend = self.backend.lock().unwrap();\n");
     s.push_str("        backend.request_join(waiter, target);\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn backend_block_on_recv(&self, task: u64, agent: u32) {\n");
+    s.push_str("        let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("        backend.block_on_recv(task, agent);\n");
+    s.push_str("    }\n\n");
+
+    s.push_str("    fn backend_wake_recv_waiters(&self, agent: u32) -> Vec<u64> {\n");
+    s.push_str("        let mut backend = self.backend.lock().unwrap();\n");
+    s.push_str("        backend.wake_recv_waiters(agent)\n");
     s.push_str("    }\n\n");
 
     s.push_str("    fn backend_cancel_bfs(&self, root: u64) -> Vec<u64> {\n");

@@ -1,16 +1,18 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::collections::{BTreeMap, VecDeque};
-use std::fs;
-use std::io::{BufReader, Read, Write};
-use std::net::TcpStream;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 
+use super::event::FuelReason;
 use super::event_reader::{
-    EventReader, KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT,
+    EventReader, KIND_IO_BEGIN, KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT,
     KIND_RUN_FINISHED,
 };
 use super::event_recorder::try_recorder;
+use super::pal::{default_pal, Pal, PalTcpStream};
 
 pub const IO_INLINE_PAYLOAD_CAP: usize = 64 * 1024;
 
@@ -59,17 +61,72 @@ impl NetConnId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IoErrorKind {
+pub enum IoErrorCode {
     NotFound,
     PermissionDenied,
+    AlreadyExists,
+    InvalidInput,
+    TimedOut,
+    ConnectionRefused,
+    ConnectionReset,
+    BrokenPipe,
+    AddrInUse,
+    AddrNotAvailable,
+    WouldBlock,
+    Interrupted,
     PayloadTooLargeForReplay,
     ReplayMismatch,
     Other,
 }
 
+impl IoErrorCode {
+    #[inline]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::NotFound => 1,
+            Self::PermissionDenied => 2,
+            Self::AlreadyExists => 3,
+            Self::InvalidInput => 4,
+            Self::TimedOut => 5,
+            Self::ConnectionRefused => 6,
+            Self::ConnectionReset => 7,
+            Self::BrokenPipe => 8,
+            Self::AddrInUse => 9,
+            Self::AddrNotAvailable => 10,
+            Self::WouldBlock => 11,
+            Self::Interrupted => 12,
+            Self::PayloadTooLargeForReplay => 13,
+            Self::ReplayMismatch => 14,
+            Self::Other => 15,
+        }
+    }
+
+    #[inline]
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::NotFound),
+            2 => Some(Self::PermissionDenied),
+            3 => Some(Self::AlreadyExists),
+            4 => Some(Self::InvalidInput),
+            5 => Some(Self::TimedOut),
+            6 => Some(Self::ConnectionRefused),
+            7 => Some(Self::ConnectionReset),
+            8 => Some(Self::BrokenPipe),
+            9 => Some(Self::AddrInUse),
+            10 => Some(Self::AddrNotAvailable),
+            11 => Some(Self::WouldBlock),
+            12 => Some(Self::Interrupted),
+            13 => Some(Self::PayloadTooLargeForReplay),
+            14 => Some(Self::ReplayMismatch),
+            15 => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IoError {
-    pub kind: IoErrorKind,
+    pub kind: IoErrorCode,
     pub message: Option<String>,
 }
 
@@ -77,21 +134,39 @@ impl IoError {
     #[inline]
     fn from_std(err: &std::io::Error) -> Self {
         let kind = match err.kind() {
-            std::io::ErrorKind::NotFound => IoErrorKind::NotFound,
-            std::io::ErrorKind::PermissionDenied => IoErrorKind::PermissionDenied,
-            _ => IoErrorKind::Other,
+            std::io::ErrorKind::NotFound => IoErrorCode::NotFound,
+            std::io::ErrorKind::PermissionDenied => IoErrorCode::PermissionDenied,
+            std::io::ErrorKind::AlreadyExists => IoErrorCode::AlreadyExists,
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+                IoErrorCode::InvalidInput
+            }
+            std::io::ErrorKind::TimedOut => IoErrorCode::TimedOut,
+            std::io::ErrorKind::ConnectionRefused => IoErrorCode::ConnectionRefused,
+            std::io::ErrorKind::ConnectionReset => IoErrorCode::ConnectionReset,
+            std::io::ErrorKind::BrokenPipe => IoErrorCode::BrokenPipe,
+            std::io::ErrorKind::AddrInUse => IoErrorCode::AddrInUse,
+            std::io::ErrorKind::AddrNotAvailable => IoErrorCode::AddrNotAvailable,
+            std::io::ErrorKind::WouldBlock => IoErrorCode::WouldBlock,
+            std::io::ErrorKind::Interrupted => IoErrorCode::Interrupted,
+            _ => match err.raw_os_error() {
+                #[cfg(unix)]
+                Some(98) | Some(10048) => IoErrorCode::AddrInUse,
+                #[cfg(unix)]
+                Some(99) | Some(10049) => IoErrorCode::AddrNotAvailable,
+                _ => IoErrorCode::Other,
+            },
         };
 
         Self {
             kind,
-            message: None,
+            message: Some(err.to_string()),
         }
     }
 
     #[inline]
     fn policy_denied() -> Self {
         Self {
-            kind: IoErrorKind::PermissionDenied,
+            kind: IoErrorCode::PermissionDenied,
             message: Some("io blocked by decision".to_string()),
         }
     }
@@ -99,7 +174,7 @@ impl IoError {
     #[inline]
     fn payload_too_large_for_replay(size: u64) -> Self {
         Self {
-            kind: IoErrorKind::PayloadTooLargeForReplay,
+            kind: IoErrorCode::PayloadTooLargeForReplay,
             message: Some(format!(
                 "replay payload omitted for size {} (> {} bytes)",
                 size, IO_INLINE_PAYLOAD_CAP
@@ -110,15 +185,15 @@ impl IoError {
     #[inline]
     fn replay_mismatch(msg: impl Into<String>) -> Self {
         Self {
-            kind: IoErrorKind::ReplayMismatch,
+            kind: IoErrorCode::ReplayMismatch,
             message: Some(msg.into()),
         }
     }
 
     #[inline]
-    fn replay_recorded_failure() -> Self {
+    fn replay_recorded_failure(code: Option<IoErrorCode>) -> Self {
         Self {
-            kind: IoErrorKind::Other,
+            kind: code.unwrap_or(IoErrorCode::Other),
             message: Some("replay recorded io failure".to_string()),
         }
     }
@@ -126,7 +201,7 @@ impl IoError {
     #[inline]
     fn replay_not_supported() -> Self {
         Self {
-            kind: IoErrorKind::Other,
+            kind: IoErrorCode::Other,
             message: Some("replay mode requires deterministic io result source".to_string()),
         }
     }
@@ -134,11 +209,41 @@ impl IoError {
     #[inline]
     fn unknown_connection(conn: NetConnId) -> Self {
         Self {
-            kind: IoErrorKind::NotFound,
+            kind: IoErrorCode::NotFound,
             message: Some(format!("unknown tcp connection id {}", conn.as_u64())),
         }
     }
+
+    #[inline]
+    fn fuel_denied() -> Self {
+        Self {
+            kind: IoErrorCode::TimedOut,
+            message: Some("io denied due to fuel exhaustion".to_string()),
+        }
+    }
+
+    #[inline]
+    fn capability_denied(cap: &str) -> Self {
+        Self {
+            kind: IoErrorCode::PermissionDenied,
+            message: Some(format!("missing capability {}", cap)),
+        }
+    }
+
+    #[inline]
+    fn backpressure_denied(limit: u64) -> Self {
+        Self {
+            kind: IoErrorCode::InvalidInput,
+            message: Some(format!("io backpressure limit exceeded: {}", limit)),
+        }
+    }
 }
+
+pub const IO_DECISION_ALLOWED: u32 = 0;
+pub const IO_DECISION_DENIED_MISSING_CAPABILITY: u32 = 1;
+pub const IO_DECISION_DENIED_FUEL: u32 = 2;
+pub const IO_DECISION_DENIED_POLICY: u32 = 3;
+pub const IO_DECISION_DENIED_BACKPRESSURE: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecMode {
@@ -180,6 +285,7 @@ impl DecisionSource for ReplayDecisionSource {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayIoPayload {
+    pub req_id: u64,
     pub hash64: u64,
     pub size: u64,
     pub bytes: Option<Vec<u8>>,
@@ -187,29 +293,36 @@ pub struct ReplayIoPayload {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayIoOp {
+    pub req_id: u64,
     pub kind: IoKind,
     pub path: String,
     pub allowed: bool,
+    pub decision_reason: u32,
     pub payload: Option<ReplayIoPayload>,
     pub result_success: bool,
     pub result_size: u64,
+    pub result_code: Option<IoErrorCode>,
 }
 
 pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
-    let file = fs::File::open(path).map_err(|e| IoError::from_std(&e))?;
+    let file = File::open(path).map_err(|e| IoError::from_std(&e))?;
     let mut reader = EventReader::new(BufReader::new(file));
     reader
         .read_log_header()
         .map_err(|e| IoError::replay_mismatch(format!("failed to read event log header: {}", e)))?;
 
     struct PendingReplayOp {
+        req_id: u64,
         kind: IoKind,
         path: String,
         allowed: Option<bool>,
+        decision_reason: u32,
         payload: Option<ReplayIoPayload>,
     }
 
     let mut pending: Option<PendingReplayOp> = None;
+    let mut pending_begin_req_id: Option<u64> = None;
+    let mut last_begin_req_id: Option<u64> = None;
     let mut out = Vec::new();
 
     while let Some(ev) = reader
@@ -221,6 +334,38 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
         }
 
         match ev.kind {
+            KIND_IO_BEGIN => {
+                let req_id = decode_io_begin(&ev.payload)?;
+                if req_id == 0 {
+                    return Err(IoError::replay_mismatch(format!(
+                        "IoBegin req_id must be > 0 at seq={}",
+                        ev.seq
+                    )));
+                }
+                if pending.is_some() || pending_begin_req_id.is_some() {
+                    return Err(IoError::replay_mismatch(format!(
+                        "IoBegin before previous IO completed at seq={}",
+                        ev.seq
+                    )));
+                }
+                match last_begin_req_id {
+                    Some(prev) if req_id != prev.saturating_add(1) => {
+                        return Err(IoError::replay_mismatch(format!(
+                            "IoBegin req_id must increase by 1: prev={} current={} at seq={}",
+                            prev, req_id, ev.seq
+                        )));
+                    }
+                    None if req_id != 1 => {
+                        return Err(IoError::replay_mismatch(format!(
+                            "first IoBegin req_id must be 1, got {} at seq={}",
+                            req_id, ev.seq
+                        )));
+                    }
+                    _ => {}
+                }
+                last_begin_req_id = Some(req_id);
+                pending_begin_req_id = Some(req_id);
+            }
             KIND_IO_REQUEST => {
                 if pending.is_some() {
                     return Err(IoError::replay_mismatch(format!(
@@ -228,16 +373,29 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
                         ev.seq
                     )));
                 }
-                let (kind, path) = decode_io_request(&ev.payload)?;
+                let (request_req_id, kind, path) = decode_io_request(&ev.payload)?;
+                let begin_req_id = pending_begin_req_id.take().unwrap_or(0);
+                if begin_req_id != 0 && request_req_id != 0 && request_req_id != begin_req_id {
+                    return Err(IoError::replay_mismatch(format!(
+                        "IoRequest req_id mismatch: begin={} request={} at seq={}",
+                        begin_req_id, request_req_id, ev.seq
+                    )));
+                }
                 pending = Some(PendingReplayOp {
+                    req_id: if begin_req_id != 0 {
+                        begin_req_id
+                    } else {
+                        request_req_id
+                    },
                     kind,
                     path,
                     allowed: None,
+                    decision_reason: 0,
                     payload: None,
                 });
             }
             KIND_IO_DECISION => {
-                let allowed = decode_io_decision(&ev.payload)?;
+                let (decision_req_id, allowed, reason_code) = decode_io_decision(&ev.payload)?;
                 let Some(state) = pending.as_mut() else {
                     return Err(IoError::replay_mismatch(format!(
                         "IoDecision without IoRequest at seq={}",
@@ -250,7 +408,14 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
                         ev.seq
                     )));
                 }
+                if state.req_id != 0 && decision_req_id != 0 && decision_req_id != state.req_id {
+                    return Err(IoError::replay_mismatch(format!(
+                        "IoDecision req_id mismatch: expected {} got {} at seq={}",
+                        state.req_id, decision_req_id, ev.seq
+                    )));
+                }
                 state.allowed = Some(allowed);
+                state.decision_reason = reason_code;
             }
             KIND_IO_PAYLOAD => {
                 let payload = decode_io_payload(&ev.payload)?;
@@ -281,10 +446,17 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
                         ev.seq
                     )));
                 }
+                if state.req_id != 0 && payload.req_id != 0 && payload.req_id != state.req_id {
+                    return Err(IoError::replay_mismatch(format!(
+                        "IoPayload req_id mismatch: expected {} got {} at seq={}",
+                        state.req_id, payload.req_id, ev.seq
+                    )));
+                }
                 state.payload = Some(payload);
             }
             KIND_IO_RESULT => {
-                let (result_success, result_size) = decode_io_result(&ev.payload)?;
+                let (result_req_id, result_success, result_size, result_code) =
+                    decode_io_result(&ev.payload)?;
                 let Some(state) = pending.take() else {
                     return Err(IoError::replay_mismatch(format!(
                         "IoResult without IoRequest at seq={}",
@@ -297,12 +469,32 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
                         ev.seq
                     )));
                 };
+                if state.req_id != 0 && result_req_id != 0 && result_req_id != state.req_id {
+                    return Err(IoError::replay_mismatch(format!(
+                        "IoResult req_id mismatch: expected {} got {} at seq={}",
+                        state.req_id, result_req_id, ev.seq
+                    )));
+                }
 
                 if !allowed && result_success {
                     return Err(IoError::replay_mismatch(format!(
                         "IoResult.success=true after denied IoDecision at seq={}",
                         ev.seq
                     )));
+                }
+                if result_success && result_code.is_some() {
+                    return Err(IoError::replay_mismatch(format!(
+                        "IoResult.success=true must not carry IoErrorCode at seq={}",
+                        ev.seq
+                    )));
+                }
+                if !result_success && result_code.is_none() {
+                    if state.req_id != 0 || result_req_id != 0 {
+                        return Err(IoError::replay_mismatch(format!(
+                            "IoResult.success=false must carry IoErrorCode at seq={}",
+                            ev.seq
+                        )));
+                    }
                 }
 
                 if allowed {
@@ -333,12 +525,15 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
                     }
 
                     out.push(ReplayIoOp {
+                        req_id: state.req_id,
                         kind: state.kind,
                         path: state.path,
                         allowed,
+                        decision_reason: state.decision_reason,
                         payload: Some(payload),
                         result_success,
                         result_size,
+                        result_code,
                     });
                 } else {
                     if state.payload.is_some() {
@@ -348,12 +543,15 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
                         )));
                     }
                     out.push(ReplayIoOp {
+                        req_id: state.req_id,
                         kind: state.kind,
                         path: state.path,
                         allowed,
+                        decision_reason: state.decision_reason,
                         payload: None,
                         result_success,
                         result_size,
+                        result_code,
                     });
                 }
             }
@@ -368,7 +566,7 @@ pub fn replay_io_ops_from_log(path: &Path) -> Result<Vec<ReplayIoOp>, IoError> {
         }
     }
 
-    if pending.is_some() {
+    if pending.is_some() || pending_begin_req_id.is_some() {
         return Err(IoError::replay_mismatch(
             "log ended with incomplete IO operation",
         ));
@@ -389,18 +587,44 @@ pub struct DefaultIoProxy {
     mode: ExecMode,
     decisions: Box<dyn DecisionSource + Send>,
     replay_ops: VecDeque<ReplayIoOp>,
+    next_req_id: u64,
+    next_replay_req_id: u64,
     next_conn_id: u64,
-    tcp_connections: BTreeMap<NetConnId, TcpStream>,
+    tcp_connections: BTreeMap<NetConnId, Box<dyn PalTcpStream>>,
+    pal: Box<dyn Pal>,
+    capabilities: BTreeSet<String>,
+    fuel_remaining: u64,
+    fuel_base_cost: u64,
+    fuel_per_byte_cost: u64,
+    max_io_bytes: u64,
 }
 
 impl DefaultIoProxy {
+    fn default_capabilities() -> BTreeSet<String> {
+        let mut caps = BTreeSet::new();
+        caps.insert("fs.read".to_string());
+        caps.insert("fs.write".to_string());
+        caps.insert("net.connect".to_string());
+        caps.insert("net.send".to_string());
+        caps.insert("net.recv".to_string());
+        caps
+    }
+
     pub fn new() -> Self {
         Self {
             mode: ExecMode::Live,
             decisions: Box::new(AllowDecisionSource),
             replay_ops: VecDeque::new(),
+            next_req_id: 1,
+            next_replay_req_id: 1,
             next_conn_id: 1,
             tcp_connections: BTreeMap::new(),
+            pal: default_pal(),
+            capabilities: Self::default_capabilities(),
+            fuel_remaining: u64::MAX,
+            fuel_base_cost: 1,
+            fuel_per_byte_cost: 0,
+            max_io_bytes: u64::MAX,
         }
     }
 
@@ -409,8 +633,16 @@ impl DefaultIoProxy {
             mode: ExecMode::Replay,
             decisions: Box::new(ReplayDecisionSource::new(decisions)),
             replay_ops: VecDeque::new(),
+            next_req_id: 1,
+            next_replay_req_id: 1,
             next_conn_id: 1,
             tcp_connections: BTreeMap::new(),
+            pal: default_pal(),
+            capabilities: Self::default_capabilities(),
+            fuel_remaining: u64::MAX,
+            fuel_base_cost: 1,
+            fuel_per_byte_cost: 0,
+            max_io_bytes: u64::MAX,
         }
     }
 
@@ -420,8 +652,16 @@ impl DefaultIoProxy {
             mode: ExecMode::Replay,
             decisions: Box::new(ReplayDecisionSource::new(decisions)),
             replay_ops: ops.into(),
+            next_req_id: 1,
+            next_replay_req_id: 1,
             next_conn_id: 1,
             tcp_connections: BTreeMap::new(),
+            pal: default_pal(),
+            capabilities: Self::default_capabilities(),
+            fuel_remaining: u64::MAX,
+            fuel_base_cost: 1,
+            fuel_per_byte_cost: 0,
+            max_io_bytes: u64::MAX,
         }
     }
 
@@ -430,39 +670,69 @@ impl DefaultIoProxy {
         Ok(Self::new_replay_with_ops(ops))
     }
 
+    pub fn set_capabilities<I, S>(&mut self, caps: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.capabilities.clear();
+        for cap in caps {
+            self.capabilities.insert(cap.as_ref().to_string());
+        }
+    }
+
+    pub fn set_fuel(&mut self, remaining: u64, base_cost: u64, per_byte_cost: u64) {
+        self.fuel_remaining = remaining;
+        self.fuel_base_cost = base_cost;
+        self.fuel_per_byte_cost = per_byte_cost;
+    }
+
+    pub fn set_max_io_bytes(&mut self, max_bytes: u64) {
+        self.max_io_bytes = max_bytes;
+    }
+
     #[inline]
     fn should_record(&self) -> bool {
         self.mode == ExecMode::Live
     }
 
-    fn record_request(kind: IoKind, path: &str) {
+    fn record_io_begin(req_id: u64) {
         if let Some(rec) = try_recorder() {
             if let Ok(mut r) = rec.lock() {
-                let _ = r.record_io_request(0, kind, path);
+                let _ = r.record_io_begin(0, req_id);
             }
         }
     }
 
-    fn record_decision(allowed: bool) {
+    fn record_request(req_id: u64, kind: IoKind, path: &str) {
         if let Some(rec) = try_recorder() {
             if let Ok(mut r) = rec.lock() {
-                let _ = r.record_io_decision(0, allowed);
+                let _ = r.record_io_request_with_req(0, req_id, kind, path);
             }
         }
     }
 
-    fn record_payload(hash64: u64, size: u64, bytes: Option<&[u8]>) {
+    fn record_decision(req_id: u64, allowed: bool, reason_code: u32) {
         if let Some(rec) = try_recorder() {
             if let Ok(mut r) = rec.lock() {
-                let _ = r.record_io_payload(0, hash64, size, bytes);
+                let _ = r.record_io_decision_with_reason(0, req_id, allowed, reason_code);
             }
         }
     }
 
-    fn record_result(success: bool, size: u64) {
+    fn record_payload(req_id: u64, hash64: u64, size: u64, bytes: Option<&[u8]>) {
         if let Some(rec) = try_recorder() {
             if let Ok(mut r) = rec.lock() {
-                let _ = r.record_io_result(0, success, size);
+                let _ = r.record_io_payload_with_req(0, req_id, hash64, size, bytes);
+            }
+        }
+    }
+
+    fn record_result(req_id: u64, success: bool, size: u64, code: Option<IoErrorCode>) {
+        if let Some(rec) = try_recorder() {
+            if let Ok(mut r) = rec.lock() {
+                let _ =
+                    r.record_io_result_with_req(0, req_id, success, size, code.map(|c| c.as_u8()));
             }
         }
     }
@@ -501,6 +771,16 @@ impl DefaultIoProxy {
             )));
         }
 
+        if op.req_id != 0 {
+            if op.req_id != self.next_replay_req_id {
+                return Err(IoError::replay_mismatch(format!(
+                    "replay io req_id mismatch: expected {} got {} for {}",
+                    self.next_replay_req_id, op.req_id, path
+                )));
+            }
+            self.next_replay_req_id = self.next_replay_req_id.saturating_add(1);
+        }
+
         Ok(op)
     }
 
@@ -526,94 +806,171 @@ impl DefaultIoProxy {
         id
     }
 
+    #[inline]
+    fn alloc_req_id(&mut self) -> u64 {
+        let req_id = self.next_req_id;
+        self.next_req_id = self.next_req_id.saturating_add(1);
+        req_id
+    }
+
+    #[inline]
+    fn has_capability(&self, cap: &str) -> bool {
+        self.capabilities.contains(cap)
+    }
+
+    #[inline]
+    fn fuel_cost(&self, bytes: u64) -> u64 {
+        self.fuel_base_cost
+            .saturating_add(self.fuel_per_byte_cost.saturating_mul(bytes))
+    }
+
+    fn consume_fuel(&mut self, bytes: u64) -> bool {
+        let cost = self.fuel_cost(bytes);
+        if self.fuel_remaining < cost {
+            return false;
+        }
+        self.fuel_remaining = self.fuel_remaining.saturating_sub(cost);
+        if let Some(rec) = try_recorder() {
+            if let Ok(mut r) = rec.lock() {
+                let _ = r.record_fuel_debit(
+                    0,
+                    0,
+                    0,
+                    u32::try_from(cost).unwrap_or(u32::MAX),
+                    FuelReason::ProxyCall,
+                );
+            }
+        }
+        true
+    }
+
+    fn deny_error(reason_code: u32, cap: Option<&str>, max_io_bytes: u64) -> IoError {
+        match reason_code {
+            IO_DECISION_DENIED_MISSING_CAPABILITY => {
+                IoError::capability_denied(cap.unwrap_or("unknown"))
+            }
+            IO_DECISION_DENIED_FUEL => IoError::fuel_denied(),
+            IO_DECISION_DENIED_BACKPRESSURE => IoError::backpressure_denied(max_io_bytes),
+            _ => IoError::policy_denied(),
+        }
+    }
+
+    fn begin_live_io(
+        &mut self,
+        kind: IoKind,
+        path: &str,
+        required_cap: &str,
+        fuel_bytes: u64,
+        bounded_bytes: Option<u64>,
+    ) -> Result<u64, IoError> {
+        let req_id = self.alloc_req_id();
+        Self::record_io_begin(req_id);
+        Self::record_request(req_id, kind, path);
+
+        let decision_from_policy = self.decide(kind, path)?;
+        let mut allowed = true;
+        let mut reason_code = IO_DECISION_ALLOWED;
+
+        if !self.has_capability(required_cap) {
+            allowed = false;
+            reason_code = IO_DECISION_DENIED_MISSING_CAPABILITY;
+        } else if let Some(bytes) = bounded_bytes {
+            if bytes > self.max_io_bytes {
+                allowed = false;
+                reason_code = IO_DECISION_DENIED_BACKPRESSURE;
+            }
+        }
+
+        if allowed && !decision_from_policy {
+            allowed = false;
+            reason_code = IO_DECISION_DENIED_POLICY;
+        }
+
+        if allowed && !self.consume_fuel(fuel_bytes) {
+            allowed = false;
+            reason_code = IO_DECISION_DENIED_FUEL;
+        }
+
+        Self::record_decision(req_id, allowed, reason_code);
+        if !allowed {
+            let deny = Self::deny_error(reason_code, Some(required_cap), self.max_io_bytes);
+            Self::record_result(req_id, false, 0, Some(deny.kind));
+            return Err(deny);
+        }
+        Ok(req_id)
+    }
+
     fn net_connect_live(&mut self, host: &str, port: u16) -> Result<NetConnId, IoError> {
         let path = Self::net_connect_path(host, port);
-        Self::record_request(IoKind::NetConnect, &path);
-
-        let allowed = self.decide(IoKind::NetConnect, &path)?;
-        Self::record_decision(allowed);
-
-        if !allowed {
-            Self::record_result(false, 0);
-            return Err(IoError::policy_denied());
-        }
+        let req_id = self.begin_live_io(IoKind::NetConnect, &path, "net.connect", 0, None)?;
 
         let conn = self.alloc_conn_id();
         let conn_bytes = conn.as_u64().to_le_bytes();
         Self::record_payload(
+            req_id,
             fnv1a64(&conn_bytes),
             conn_bytes.len() as u64,
             Some(&conn_bytes),
         );
 
-        match TcpStream::connect((host, port)) {
+        match self.pal.tcp_connect(host, port) {
             Ok(stream) => {
                 self.tcp_connections.insert(conn, stream);
-                Self::record_result(true, conn_bytes.len() as u64);
+                Self::record_result(req_id, true, conn_bytes.len() as u64, None);
                 Ok(conn)
             }
             Err(err) => {
-                Self::record_result(false, conn_bytes.len() as u64);
-                Err(IoError::from_std(&err))
+                let ioe = IoError::from_std(&err);
+                Self::record_result(req_id, false, conn_bytes.len() as u64, Some(ioe.kind));
+                Err(ioe)
             }
         }
     }
 
     fn net_send_live(&mut self, conn: NetConnId, data: &[u8]) -> Result<(), IoError> {
         let path = Self::net_send_path(conn);
-        Self::record_request(IoKind::NetSend, &path);
-
-        let allowed = self.decide(IoKind::NetSend, &path)?;
-        Self::record_decision(allowed);
-
         let size = data.len() as u64;
-        if !allowed {
-            Self::record_result(false, size);
-            return Err(IoError::policy_denied());
-        }
+        let req_id = self.begin_live_io(IoKind::NetSend, &path, "net.send", size, Some(size))?;
 
         let inline = if data.len() <= IO_INLINE_PAYLOAD_CAP {
             Some(data)
         } else {
             None
         };
-        Self::record_payload(fnv1a64(data), size, inline);
+        Self::record_payload(req_id, fnv1a64(data), size, inline);
 
         let Some(stream) = self.tcp_connections.get_mut(&conn) else {
-            Self::record_result(false, size);
-            return Err(IoError::unknown_connection(conn));
+            let ioe = IoError::unknown_connection(conn);
+            Self::record_result(req_id, false, size, Some(ioe.kind));
+            return Err(ioe);
         };
 
         match stream.write_all(data) {
             Ok(()) => {
-                Self::record_result(true, size);
+                Self::record_result(req_id, true, size, None);
                 Ok(())
             }
             Err(err) => {
-                Self::record_result(false, size);
-                Err(IoError::from_std(&err))
+                let ioe = IoError::from_std(&err);
+                Self::record_result(req_id, false, size, Some(ioe.kind));
+                Err(ioe)
             }
         }
     }
 
     fn net_recv_live(&mut self, conn: NetConnId, max: u32) -> Result<Vec<u8>, IoError> {
         let path = Self::net_recv_path(conn, max);
-        Self::record_request(IoKind::NetRecv, &path);
-
-        let allowed = self.decide(IoKind::NetRecv, &path)?;
-        Self::record_decision(allowed);
-
-        if !allowed {
-            Self::record_result(false, 0);
-            return Err(IoError::policy_denied());
-        }
+        let max_u64 = u64::from(max);
+        let req_id =
+            self.begin_live_io(IoKind::NetRecv, &path, "net.recv", max_u64, Some(max_u64))?;
 
         let max_len = usize::try_from(max).unwrap_or(usize::MAX);
         let Some(stream) = self.tcp_connections.get_mut(&conn) else {
             let empty: [u8; 0] = [];
-            Self::record_payload(fnv1a64(&empty), 0, Some(&empty));
-            Self::record_result(false, 0);
-            return Err(IoError::unknown_connection(conn));
+            Self::record_payload(req_id, fnv1a64(&empty), 0, Some(&empty));
+            let ioe = IoError::unknown_connection(conn);
+            Self::record_result(req_id, false, 0, Some(ioe.kind));
+            return Err(ioe);
         };
 
         let mut buf = vec![0u8; max_len];
@@ -627,31 +984,24 @@ impl DefaultIoProxy {
                 } else {
                     None
                 };
-                Self::record_payload(hash64, size, inline);
-                Self::record_result(true, size);
+                Self::record_payload(req_id, hash64, size, inline);
+                Self::record_result(req_id, true, size, None);
                 Ok(buf)
             }
             Err(err) => {
                 let empty: [u8; 0] = [];
-                Self::record_payload(fnv1a64(&empty), 0, Some(&empty));
-                Self::record_result(false, 0);
-                Err(IoError::from_std(&err))
+                Self::record_payload(req_id, fnv1a64(&empty), 0, Some(&empty));
+                let ioe = IoError::from_std(&err);
+                Self::record_result(req_id, false, 0, Some(ioe.kind));
+                Err(ioe)
             }
         }
     }
 
     fn fs_read_live(&mut self, path: &str) -> Result<Vec<u8>, IoError> {
-        Self::record_request(IoKind::FsRead, path);
+        let req_id = self.begin_live_io(IoKind::FsRead, path, "fs.read", 0, None)?;
 
-        let allowed = self.decide(IoKind::FsRead, path)?;
-        Self::record_decision(allowed);
-
-        if !allowed {
-            Self::record_result(false, 0);
-            return Err(IoError::policy_denied());
-        }
-
-        match fs::read(path) {
+        match self.pal.fs_read(path) {
             Ok(bytes) => {
                 let size = bytes.len() as u64;
                 let hash64 = fnv1a64(&bytes);
@@ -660,43 +1010,36 @@ impl DefaultIoProxy {
                 } else {
                     None
                 };
-                Self::record_payload(hash64, size, inline);
-                Self::record_result(true, size);
+                Self::record_payload(req_id, hash64, size, inline);
+                Self::record_result(req_id, true, size, None);
                 Ok(bytes)
             }
             Err(err) => {
                 let empty: [u8; 0] = [];
-                Self::record_payload(fnv1a64(&empty), 0, Some(&empty));
-                Self::record_result(false, 0);
-                Err(IoError::from_std(&err))
+                Self::record_payload(req_id, fnv1a64(&empty), 0, Some(&empty));
+                let ioe = IoError::from_std(&err);
+                Self::record_result(req_id, false, 0, Some(ioe.kind));
+                Err(ioe)
             }
         }
     }
 
     fn fs_write_live(&mut self, path: &str, data: &[u8]) -> Result<(), IoError> {
-        Self::record_request(IoKind::FsWrite, path);
-
-        let allowed = self.decide(IoKind::FsWrite, path)?;
-        Self::record_decision(allowed);
-
         let size = data.len() as u64;
-
-        if !allowed {
-            Self::record_result(false, size);
-            return Err(IoError::policy_denied());
-        }
+        let req_id = self.begin_live_io(IoKind::FsWrite, path, "fs.write", size, Some(size))?;
 
         let hash64 = fnv1a64(data);
-        Self::record_payload(hash64, size, None);
+        Self::record_payload(req_id, hash64, size, None);
 
-        match fs::write(path, data) {
+        match self.pal.fs_write(path, data) {
             Ok(()) => {
-                Self::record_result(true, size);
+                Self::record_result(req_id, true, size, None);
                 Ok(())
             }
             Err(err) => {
-                Self::record_result(false, size);
-                Err(IoError::from_std(&err))
+                let ioe = IoError::from_std(&err);
+                Self::record_result(req_id, false, size, Some(ioe.kind));
+                Err(ioe)
             }
         }
     }
@@ -715,7 +1058,11 @@ impl DefaultIoProxy {
                     "denied fs_read cannot have success=true IoResult",
                 ));
             }
-            return Err(IoError::policy_denied());
+            return Err(Self::deny_error(
+                op.decision_reason,
+                Some("fs.read"),
+                self.max_io_bytes,
+            ));
         }
 
         let payload = op.payload.ok_or_else(|| {
@@ -730,7 +1077,7 @@ impl DefaultIoProxy {
         }
 
         if !op.result_success {
-            return Err(IoError::replay_recorded_failure());
+            return Err(IoError::replay_recorded_failure(op.result_code));
         }
 
         match payload.bytes {
@@ -777,7 +1124,11 @@ impl DefaultIoProxy {
                     "denied fs_write cannot have success=true IoResult",
                 ));
             }
-            return Err(IoError::policy_denied());
+            return Err(Self::deny_error(
+                op.decision_reason,
+                Some("fs.write"),
+                self.max_io_bytes,
+            ));
         }
 
         let payload = op.payload.ok_or_else(|| {
@@ -816,7 +1167,7 @@ impl DefaultIoProxy {
         if op.result_success {
             Ok(())
         } else {
-            Err(IoError::replay_recorded_failure())
+            Err(IoError::replay_recorded_failure(op.result_code))
         }
     }
 
@@ -835,7 +1186,11 @@ impl DefaultIoProxy {
                     "denied net_connect cannot have success=true IoResult",
                 ));
             }
-            return Err(IoError::policy_denied());
+            return Err(Self::deny_error(
+                op.decision_reason,
+                Some("net.connect"),
+                self.max_io_bytes,
+            ));
         }
 
         let payload = op.payload.ok_or_else(|| {
@@ -861,7 +1216,7 @@ impl DefaultIoProxy {
         if op.result_success {
             Ok(conn)
         } else {
-            Err(IoError::replay_recorded_failure())
+            Err(IoError::replay_recorded_failure(op.result_code))
         }
     }
 
@@ -880,7 +1235,11 @@ impl DefaultIoProxy {
                     "denied net_send cannot have success=true IoResult",
                 ));
             }
-            return Err(IoError::policy_denied());
+            return Err(Self::deny_error(
+                op.decision_reason,
+                Some("net.send"),
+                self.max_io_bytes,
+            ));
         }
 
         let payload = op
@@ -922,7 +1281,7 @@ impl DefaultIoProxy {
         if op.result_success {
             Ok(())
         } else {
-            Err(IoError::replay_recorded_failure())
+            Err(IoError::replay_recorded_failure(op.result_code))
         }
     }
 
@@ -941,7 +1300,11 @@ impl DefaultIoProxy {
                     "denied net_recv cannot have success=true IoResult",
                 ));
             }
-            return Err(IoError::policy_denied());
+            return Err(Self::deny_error(
+                op.decision_reason,
+                Some("net.recv"),
+                self.max_io_bytes,
+            ));
         }
 
         let payload = op
@@ -956,7 +1319,7 @@ impl DefaultIoProxy {
         }
 
         if !op.result_success {
-            return Err(IoError::replay_recorded_failure());
+            return Err(IoError::replay_recorded_failure(op.result_code));
         }
 
         match payload.bytes {
@@ -1034,7 +1397,21 @@ impl IoProxy for DefaultIoProxy {
     }
 }
 
-fn decode_io_request(payload: &[u8]) -> Result<(IoKind, String), IoError> {
+fn decode_io_request(payload: &[u8]) -> Result<(u64, IoKind, String), IoError> {
+    if payload.len() >= 11 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().expect("request req_id bytes"));
+        if let Some(kind) = IoKind::from_u8(payload[8]) {
+            let path_len =
+                u16::from_le_bytes(payload[9..11].try_into().expect("path len bytes")) as usize;
+            if payload.len() == 11 + path_len {
+                let path = std::str::from_utf8(&payload[11..])
+                    .map_err(|e| IoError::replay_mismatch(format!("IoRequest path utf8: {}", e)))?
+                    .to_string();
+                return Ok((req_id, kind, path));
+            }
+        }
+    }
+
     if payload.len() < 3 {
         return Err(IoError::replay_mismatch(format!(
             "IoRequest payload too short: {}",
@@ -1059,10 +1436,39 @@ fn decode_io_request(payload: &[u8]) -> Result<(IoKind, String), IoError> {
         .map_err(|e| IoError::replay_mismatch(format!("IoRequest path utf8: {}", e)))?
         .to_string();
 
-    Ok((kind, path))
+    Ok((0, kind, path))
 }
 
-fn decode_io_decision(payload: &[u8]) -> Result<bool, IoError> {
+fn decode_io_begin(payload: &[u8]) -> Result<u64, IoError> {
+    if payload.len() != 8 {
+        return Err(IoError::replay_mismatch(format!(
+            "IoBegin payload length mismatch: expected 8, got {}",
+            payload.len()
+        )));
+    }
+    Ok(u64::from_le_bytes(
+        payload[0..8].try_into().expect("io begin req_id"),
+    ))
+}
+
+fn decode_io_decision(payload: &[u8]) -> Result<(u64, bool, u32), IoError> {
+    if payload.len() == 13 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().expect("decision req_id bytes"));
+        let allowed = match payload[8] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(IoError::replay_mismatch(format!(
+                    "invalid IoDecision allowed value {}",
+                    v
+                )));
+            }
+        };
+        let reason_code =
+            u32::from_le_bytes(payload[9..13].try_into().expect("decision reason bytes"));
+        return Ok((req_id, allowed, reason_code));
+    }
+
     if payload.len() != 1 {
         return Err(IoError::replay_mismatch(format!(
             "IoDecision payload length mismatch: expected 1, got {}",
@@ -1071,8 +1477,8 @@ fn decode_io_decision(payload: &[u8]) -> Result<bool, IoError> {
     }
 
     match payload[0] {
-        0 => Ok(false),
-        1 => Ok(true),
+        0 => Ok((0, false, IO_DECISION_DENIED_POLICY)),
+        1 => Ok((0, true, IO_DECISION_ALLOWED)),
         v => Err(IoError::replay_mismatch(format!(
             "invalid IoDecision allowed value {}",
             v
@@ -1080,7 +1486,46 @@ fn decode_io_decision(payload: &[u8]) -> Result<bool, IoError> {
     }
 }
 
-fn decode_io_result(payload: &[u8]) -> Result<(bool, u64), IoError> {
+fn decode_io_result(payload: &[u8]) -> Result<(u64, bool, u64, Option<IoErrorCode>), IoError> {
+    if payload.len() == 18 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().expect("result req_id bytes"));
+        let success = match payload[8] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(IoError::replay_mismatch(format!(
+                    "invalid IoResult success value {}",
+                    v
+                )));
+            }
+        };
+        let size = u64::from_le_bytes(payload[9..17].try_into().expect("result size bytes"));
+        let code = if payload[17] == u8::MAX {
+            None
+        } else {
+            Some(IoErrorCode::from_u8(payload[17]).ok_or_else(|| {
+                IoError::replay_mismatch(format!("invalid IoResult code value {}", payload[17]))
+            })?)
+        };
+        return Ok((req_id, success, size, code));
+    }
+
+    if payload.len() == 17 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().expect("result req_id bytes"));
+        let success = match payload[8] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(IoError::replay_mismatch(format!(
+                    "invalid IoResult success value {}",
+                    v
+                )));
+            }
+        };
+        let size = u64::from_le_bytes(payload[9..17].try_into().expect("result size bytes"));
+        return Ok((req_id, success, size, None));
+    }
+
     if payload.len() != 9 {
         return Err(IoError::replay_mismatch(format!(
             "IoResult payload length mismatch: expected 9, got {}",
@@ -1100,10 +1545,37 @@ fn decode_io_result(payload: &[u8]) -> Result<(bool, u64), IoError> {
     };
 
     let size = u64::from_le_bytes(payload[1..9].try_into().expect("result size bytes"));
-    Ok((success, size))
+    Ok((0, success, size, None))
 }
 
 fn decode_io_payload(payload: &[u8]) -> Result<ReplayIoPayload, IoError> {
+    if payload.len() >= 25 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().expect("payload req_id bytes"));
+        let hash64 = u64::from_le_bytes(payload[8..16].try_into().expect("payload hash bytes"));
+        let size = u64::from_le_bytes(payload[16..24].try_into().expect("payload size bytes"));
+        let has_bytes = payload[24];
+        if has_bytes == 0 && payload.len() == 25 {
+            return Ok(ReplayIoPayload {
+                req_id,
+                hash64,
+                size,
+                bytes: None,
+            });
+        }
+        if has_bytes == 1 && payload.len() >= 29 {
+            let len =
+                u32::from_le_bytes(payload[25..29].try_into().expect("payload bytes len")) as usize;
+            if payload.len() == 29 + len {
+                return Ok(ReplayIoPayload {
+                    req_id,
+                    hash64,
+                    size,
+                    bytes: Some(payload[29..].to_vec()),
+                });
+            }
+        }
+    }
+
     if payload.len() < 17 {
         return Err(IoError::replay_mismatch(format!(
             "IoPayload payload too short: {}",
@@ -1123,6 +1595,7 @@ fn decode_io_payload(payload: &[u8]) -> Result<ReplayIoPayload, IoError> {
                 )));
             }
             Ok(ReplayIoPayload {
+                req_id: 0,
                 hash64,
                 size,
                 bytes: None,
@@ -1145,6 +1618,7 @@ fn decode_io_payload(payload: &[u8]) -> Result<ReplayIoPayload, IoError> {
                 )));
             }
             Ok(ReplayIoPayload {
+                req_id: 0,
                 hash64,
                 size,
                 bytes: Some(payload[21..].to_vec()),
@@ -1269,7 +1743,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 #[cfg(all(test, feature = "coop_scheduler"))]
 mod tests {
-    use super::{DefaultIoProxy, IoKind, IoProxy, NetConnId};
+    use super::{DefaultIoProxy, IoErrorCode, IoKind, IoProxy, NetConnId};
     use crate::replay::verify_log;
     use crate::runtime::event_reader::{
         EventReader, KIND_IO_DECISION, KIND_IO_PAYLOAD, KIND_IO_REQUEST, KIND_IO_RESULT,
@@ -1624,6 +2098,55 @@ mod tests {
             msg.contains("IoPayload hash mismatch for net_send"),
             "unexpected replay error for corrupted net send hash: {}",
             msg
+        );
+    }
+
+    #[test]
+    fn live_fs_write_denied_without_capability() {
+        let base = std::env::temp_dir().join("nex_io_proxy_caps");
+        let target = base.join("deny.txt");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create base");
+
+        let mut proxy = DefaultIoProxy::new();
+        proxy.set_capabilities(["fs.read"]);
+
+        let err = proxy
+            .fs_write(target.to_str().expect("utf8 path"), b"x")
+            .expect_err("missing fs.write should deny");
+        assert_eq!(err.kind, IoErrorCode::PermissionDenied);
+        assert!(
+            !target.exists(),
+            "denied fs_write must not create filesystem output"
+        );
+    }
+
+    #[test]
+    fn live_io_denied_when_fuel_exhausted() {
+        let mut proxy = DefaultIoProxy::new();
+        proxy.set_fuel(0, 1, 0);
+        let err = proxy
+            .fs_read("/tmp/nex_io_proxy_noop")
+            .expect_err("fuel exhausted should deny before syscall");
+        assert_eq!(err.kind, IoErrorCode::TimedOut);
+    }
+
+    #[test]
+    fn live_io_backpressure_limit_denies_large_write() {
+        let base = std::env::temp_dir().join("nex_io_proxy_backpressure");
+        let target = base.join("bp.txt");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).expect("create base");
+
+        let mut proxy = DefaultIoProxy::new();
+        proxy.set_max_io_bytes(1);
+        let err = proxy
+            .fs_write(target.to_str().expect("utf8 path"), b"AB")
+            .expect_err("write above backpressure limit should deny");
+        assert_eq!(err.kind, IoErrorCode::InvalidInput);
+        assert!(
+            !target.exists(),
+            "backpressure-denied fs_write must not create output"
         );
     }
 

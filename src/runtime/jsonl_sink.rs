@@ -161,9 +161,16 @@ fn json_line_for_record(header: &EventHeader, payload: &[u8]) -> io::Result<Stri
             fields.push(format!(r#""reason_code":{}"#, p.reason.as_u8()));
         }
 
+        EventKind::IoBegin => {
+            let req_id = decode_io_begin(payload)?;
+            fields.push(r#""event":"IoBegin""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, req_id));
+        }
+
         EventKind::IoRequest => {
             let p = decode_io_request(payload)?;
             fields.push(r#""event":"IoRequest""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
             fields.push(format!(r#""io_kind":{}"#, p.kind.as_u8()));
             fields.push(format!(r#""path":"{}""#, escape_json(&p.path)));
         }
@@ -171,25 +178,33 @@ fn json_line_for_record(header: &EventHeader, payload: &[u8]) -> io::Result<Stri
         EventKind::IoDecision => {
             let p = decode_io_decision(payload)?;
             fields.push(r#""event":"IoDecision""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
             fields.push(format!(
                 r#""allowed":{}"#,
                 if p.allowed { "true" } else { "false" }
             ));
+            fields.push(format!(r#""reason_code":{}"#, p.reason_code));
         }
 
         EventKind::IoResult => {
             let p = decode_io_result(payload)?;
             fields.push(r#""event":"IoResult""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
             fields.push(format!(
                 r#""success":{}"#,
                 if p.success { "true" } else { "false" }
             ));
             fields.push(format!(r#""size":{}"#, p.size));
+            match p.code {
+                Some(code) => fields.push(format!(r#""code":{}"#, code)),
+                None => fields.push(r#""code":null"#.to_string()),
+            }
         }
 
         EventKind::IoPayload => {
             let p = decode_io_payload(payload)?;
             fields.push(r#""event":"IoPayload""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
             fields.push(format!(r#""hash64":{}"#, p.hash64));
             fields.push(format!(r#""size":{}"#, p.size));
             match p.bytes {
@@ -216,6 +231,98 @@ fn json_line_for_record(header: &EventHeader, payload: &[u8]) -> io::Result<Stri
             fields.push(r#""event":"BusRecv""#.to_string());
             fields.push(format!(r#""req_id":{}"#, p.req_id));
             fields.push(format!(r#""receiver":{}"#, p.receiver));
+        }
+
+        EventKind::BusSendRequest => {
+            let p = decode_bus_send_request(payload)?;
+            fields.push(r#""event":"BusSendRequest""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""sender":{}"#, p.sender));
+            fields.push(format!(r#""receiver":{}"#, p.receiver));
+            fields.push(format!(r#""schema_id":{}"#, p.schema_id));
+            fields.push(format!(r#""bytes":{}"#, p.bytes));
+        }
+
+        EventKind::BusDecision => {
+            let p = decode_bus_decision(payload)?;
+            fields.push(r#""event":"BusDecision""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(
+                r#""allowed":{}"#,
+                if p.allowed { "true" } else { "false" }
+            ));
+            fields.push(format!(r#""reason_code":{}"#, p.reason_code));
+        }
+
+        EventKind::BusSendResult => {
+            let p = decode_bus_send_result(payload)?;
+            fields.push(r#""event":"BusSendResult""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""ok":{}"#, if p.ok { "true" } else { "false" }));
+        }
+
+        EventKind::MessageSent => {
+            let p = decode_message_sent(payload)?;
+            fields.push(r#""event":"MessageSent""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""channel_id":{}"#, p.channel_id));
+            fields.push(format!(r#""sender_id":{}"#, p.sender_id));
+            fields.push(format!(r#""sender_seq":{}"#, p.sender_seq));
+            fields.push(format!(r#""schema_id":{}"#, p.schema_id));
+            fields.push(format!(r#""hash64":{}"#, p.hash64));
+            fields.push(format!(r#""size":{}"#, p.size));
+        }
+
+        EventKind::MessageDelivered => {
+            let p = decode_message_delivered(payload)?;
+            fields.push(r#""event":"MessageDelivered""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""channel_id":{}"#, p.channel_id));
+            fields.push(format!(r#""receiver_id":{}"#, p.receiver_id));
+            fields.push(format!(r#""sender_id":{}"#, p.sender_id));
+            fields.push(format!(r#""sender_seq":{}"#, p.sender_seq));
+            fields.push(format!(r#""hash64":{}"#, p.hash64));
+            fields.push(format!(r#""size":{}"#, p.size));
+        }
+
+        EventKind::MessageBlocked => {
+            let p = decode_message_blocked(payload)?;
+            fields.push(r#""event":"MessageBlocked""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""channel_id":{}"#, p.channel_id));
+            fields.push(format!(r#""receiver_id":{}"#, p.receiver_id));
+        }
+
+        EventKind::ChannelCreated => {
+            let p = decode_channel_created(payload)?;
+            fields.push(r#""event":"ChannelCreated""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""channel_id":{}"#, p.channel_id));
+            fields.push(format!(r#""schema_id":{}"#, p.schema_id));
+            fields.push(format!(r#""limits_digest":{}"#, p.limits_digest));
+        }
+
+        EventKind::ChannelClosed => {
+            let p = decode_channel_closed(payload)?;
+            fields.push(r#""event":"ChannelClosed""#.to_string());
+            fields.push(format!(r#""req_id":{}"#, p.req_id));
+            fields.push(format!(r#""channel_id":{}"#, p.channel_id));
+        }
+
+        EventKind::DeadlockDetected => {
+            let p = decode_deadlock_detected(payload)?;
+            fields.push(r#""event":"DeadlockDetected""#.to_string());
+            fields.push(format!(r#""tick":{}"#, p.tick));
+            fields.push(format!(r#""blocked":{}"#, p.blocked));
+            fields.push(format!(r#""kind_code":{}"#, p.kind));
+        }
+
+        EventKind::DeadlockEdge => {
+            let p = decode_deadlock_edge(payload)?;
+            fields.push(r#""event":"DeadlockEdge""#.to_string());
+            fields.push(format!(r#""from":{}"#, p.from));
+            fields.push(format!(r#""to":{}"#, p.to));
+            fields.push(format!(r#""reason_code":{}"#, p.reason));
         }
     }
 
@@ -251,6 +358,8 @@ fn decode_capability_invoked(payload: &[u8]) -> io::Result<CapabilityInvoked> {
         cap_kind: match u16::from_le_bytes(payload[0..2].try_into().unwrap()) {
             1 => CapabilityKind::FsRead,
             2 => CapabilityKind::NetListen,
+            3 => CapabilityKind::BusSend,
+            4 => CapabilityKind::BusRecv,
             _ => CapabilityKind::FsRead,
         },
         cap_id: u32::from_le_bytes(payload[2..6].try_into().unwrap()),
@@ -411,7 +520,58 @@ fn decode_fuel_debit(payload: &[u8]) -> io::Result<FuelDebit> {
     })
 }
 
-fn decode_io_request(payload: &[u8]) -> io::Result<IoRequest> {
+fn decode_io_begin(payload: &[u8]) -> io::Result<u64> {
+    require_len(payload, 8, "IoBegin")?;
+    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JsonIoRequest {
+    req_id: u64,
+    kind: IoKind,
+    path: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JsonIoDecision {
+    req_id: u64,
+    allowed: bool,
+    reason_code: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JsonIoResult {
+    req_id: u64,
+    success: bool,
+    size: u64,
+    code: Option<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JsonIoPayload {
+    req_id: u64,
+    hash64: u64,
+    size: u64,
+    bytes: Option<Vec<u8>>,
+}
+
+fn decode_io_request(payload: &[u8]) -> io::Result<JsonIoRequest> {
+    if payload.len() >= 11 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let maybe_kind = IoKind::from_u8(payload[8]);
+        if let Some(kind) = maybe_kind {
+            let path_len = u16::from_le_bytes(payload[9..11].try_into().unwrap()) as usize;
+            if payload.len() == 11 + path_len {
+                let path = std::str::from_utf8(&payload[11..])
+                    .map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("IoRequest.path: {}", e))
+                    })?
+                    .to_string();
+                return Ok(JsonIoRequest { req_id, kind, path });
+            }
+        }
+    }
+
     if payload.len() < 3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -441,14 +601,46 @@ fn decode_io_request(payload: &[u8]) -> io::Result<IoRequest> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("IoRequest.path: {}", e)))?
         .to_string();
 
-    Ok(IoRequest { kind, path })
+    Ok(JsonIoRequest {
+        req_id: 0,
+        kind,
+        path,
+    })
 }
 
-fn decode_io_decision(payload: &[u8]) -> io::Result<IoDecision> {
+fn decode_io_decision(payload: &[u8]) -> io::Result<JsonIoDecision> {
+    if payload.len() == 13 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let allowed = match payload[8] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid IoDecision.allowed {}", v),
+                ));
+            }
+        };
+        let reason_code = u32::from_le_bytes(payload[9..13].try_into().unwrap());
+        return Ok(JsonIoDecision {
+            req_id,
+            allowed,
+            reason_code,
+        });
+    }
+
     require_len(payload, 1, "IoDecision")?;
     match payload[0] {
-        0 => Ok(IoDecision { allowed: false }),
-        1 => Ok(IoDecision { allowed: true }),
+        0 => Ok(JsonIoDecision {
+            req_id: 0,
+            allowed: false,
+            reason_code: 0,
+        }),
+        1 => Ok(JsonIoDecision {
+            req_id: 0,
+            allowed: true,
+            reason_code: 0,
+        }),
         v => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("invalid IoDecision.allowed {}", v),
@@ -456,7 +648,54 @@ fn decode_io_decision(payload: &[u8]) -> io::Result<IoDecision> {
     }
 }
 
-fn decode_io_result(payload: &[u8]) -> io::Result<IoResult> {
+fn decode_io_result(payload: &[u8]) -> io::Result<JsonIoResult> {
+    if payload.len() == 18 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let success = match payload[8] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid IoResult.success {}", v),
+                ));
+            }
+        };
+        let size = u64::from_le_bytes(payload[9..17].try_into().unwrap());
+        let code = if payload[17] == u8::MAX {
+            None
+        } else {
+            Some(payload[17])
+        };
+        return Ok(JsonIoResult {
+            req_id,
+            success,
+            size,
+            code,
+        });
+    }
+
+    if payload.len() == 17 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let success = match payload[8] {
+            0 => false,
+            1 => true,
+            v => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid IoResult.success {}", v),
+                ));
+            }
+        };
+        let size = u64::from_le_bytes(payload[9..17].try_into().unwrap());
+        return Ok(JsonIoResult {
+            req_id,
+            success,
+            size,
+            code: None,
+        });
+    }
+
     require_len(payload, 9, "IoResult")?;
     let success = match payload[0] {
         0 => false,
@@ -468,13 +707,41 @@ fn decode_io_result(payload: &[u8]) -> io::Result<IoResult> {
             ));
         }
     };
-    Ok(IoResult {
+    Ok(JsonIoResult {
+        req_id: 0,
         success,
         size: u64::from_le_bytes(payload[1..9].try_into().unwrap()),
+        code: None,
     })
 }
 
-fn decode_io_payload(payload: &[u8]) -> io::Result<IoPayload> {
+fn decode_io_payload(payload: &[u8]) -> io::Result<JsonIoPayload> {
+    if payload.len() >= 25 {
+        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let hash64 = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+        let size = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+        let has_bytes = payload[24];
+        if has_bytes == 0 && payload.len() == 25 {
+            return Ok(JsonIoPayload {
+                req_id,
+                hash64,
+                size,
+                bytes: None,
+            });
+        }
+        if has_bytes == 1 && payload.len() >= 29 {
+            let len = u32::from_le_bytes(payload[25..29].try_into().unwrap()) as usize;
+            if payload.len() == 29 + len {
+                return Ok(JsonIoPayload {
+                    req_id,
+                    hash64,
+                    size,
+                    bytes: Some(payload[29..].to_vec()),
+                });
+            }
+        }
+    }
+
     if payload.len() < 17 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -495,7 +762,8 @@ fn decode_io_payload(payload: &[u8]) -> io::Result<IoPayload> {
                     ),
                 ));
             }
-            Ok(IoPayload {
+            Ok(JsonIoPayload {
+                req_id: 0,
                 hash64,
                 size,
                 bytes: None,
@@ -519,7 +787,8 @@ fn decode_io_payload(payload: &[u8]) -> io::Result<IoPayload> {
                     ),
                 ));
             }
-            Ok(IoPayload {
+            Ok(JsonIoPayload {
+                req_id: 0,
                 hash64,
                 size,
                 bytes: Some(payload[21..].to_vec()),
@@ -549,6 +818,125 @@ fn decode_bus_recv(payload: &[u8]) -> io::Result<BusRecv> {
     Ok(BusRecv {
         req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
         receiver: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+    })
+}
+
+fn decode_bus_send_request(payload: &[u8]) -> io::Result<BusSendRequest> {
+    require_len(payload, 24, "BusSendRequest")?;
+    Ok(BusSendRequest {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        sender: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+        receiver: u32::from_le_bytes(payload[12..16].try_into().unwrap()),
+        schema_id: u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+        bytes: u32::from_le_bytes(payload[20..24].try_into().unwrap()),
+    })
+}
+
+fn decode_bus_decision(payload: &[u8]) -> io::Result<BusDecision> {
+    require_len(payload, 13, "BusDecision")?;
+    let allowed = match payload[8] {
+        0 => false,
+        1 => true,
+        v => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid BusDecision.allowed {}", v),
+            ));
+        }
+    };
+    Ok(BusDecision {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        allowed,
+        reason_code: u32::from_le_bytes(payload[9..13].try_into().unwrap()),
+    })
+}
+
+fn decode_bus_send_result(payload: &[u8]) -> io::Result<BusSendResult> {
+    require_len(payload, 9, "BusSendResult")?;
+    let ok = match payload[8] {
+        0 => false,
+        1 => true,
+        v => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid BusSendResult.ok {}", v),
+            ));
+        }
+    };
+    Ok(BusSendResult {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        ok,
+    })
+}
+
+fn decode_channel_created(payload: &[u8]) -> io::Result<ChannelCreated> {
+    require_len(payload, 32, "ChannelCreated")?;
+    Ok(ChannelCreated {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        channel_id: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+        schema_id: u64::from_le_bytes(payload[16..24].try_into().unwrap()),
+        limits_digest: u64::from_le_bytes(payload[24..32].try_into().unwrap()),
+    })
+}
+
+fn decode_channel_closed(payload: &[u8]) -> io::Result<ChannelClosed> {
+    require_len(payload, 16, "ChannelClosed")?;
+    Ok(ChannelClosed {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        channel_id: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+    })
+}
+
+fn decode_message_sent(payload: &[u8]) -> io::Result<MessageSent> {
+    require_len(payload, 48, "MessageSent")?;
+    Ok(MessageSent {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        channel_id: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+        sender_id: u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+        sender_seq: u64::from_le_bytes(payload[20..28].try_into().unwrap()),
+        schema_id: u64::from_le_bytes(payload[28..36].try_into().unwrap()),
+        hash64: u64::from_le_bytes(payload[36..44].try_into().unwrap()),
+        size: u32::from_le_bytes(payload[44..48].try_into().unwrap()),
+    })
+}
+
+fn decode_message_delivered(payload: &[u8]) -> io::Result<MessageDelivered> {
+    require_len(payload, 44, "MessageDelivered")?;
+    Ok(MessageDelivered {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        channel_id: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+        receiver_id: u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+        sender_id: u32::from_le_bytes(payload[20..24].try_into().unwrap()),
+        sender_seq: u64::from_le_bytes(payload[24..32].try_into().unwrap()),
+        hash64: u64::from_le_bytes(payload[32..40].try_into().unwrap()),
+        size: u32::from_le_bytes(payload[40..44].try_into().unwrap()),
+    })
+}
+
+fn decode_message_blocked(payload: &[u8]) -> io::Result<MessageBlocked> {
+    require_len(payload, 20, "MessageBlocked")?;
+    Ok(MessageBlocked {
+        req_id: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        channel_id: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+        receiver_id: u32::from_le_bytes(payload[16..20].try_into().unwrap()),
+    })
+}
+
+fn decode_deadlock_detected(payload: &[u8]) -> io::Result<DeadlockDetected> {
+    require_len(payload, 13, "DeadlockDetected")?;
+    Ok(DeadlockDetected {
+        tick: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+        blocked: u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+        kind: payload[12],
+    })
+}
+
+fn decode_deadlock_edge(payload: &[u8]) -> io::Result<DeadlockEdge> {
+    require_len(payload, 9, "DeadlockEdge")?;
+    Ok(DeadlockEdge {
+        from: u32::from_le_bytes(payload[0..4].try_into().unwrap()),
+        to: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+        reason: payload[8],
     })
 }
 

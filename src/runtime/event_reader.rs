@@ -57,6 +57,17 @@ pub const KIND_IO_RESULT: u16 = 19;
 pub const KIND_IO_PAYLOAD: u16 = 20;
 pub const KIND_BUS_SEND: u16 = 21;
 pub const KIND_BUS_RECV: u16 = 22;
+pub const KIND_BUS_SEND_REQUEST: u16 = 23;
+pub const KIND_BUS_DECISION: u16 = 24;
+pub const KIND_BUS_SEND_RESULT: u16 = 25;
+pub const KIND_DEADLOCK_DETECTED: u16 = 26;
+pub const KIND_DEADLOCK_EDGE: u16 = 27;
+pub const KIND_IO_BEGIN: u16 = 28;
+pub const KIND_MESSAGE_SENT: u16 = 29;
+pub const KIND_MESSAGE_DELIVERED: u16 = 30;
+pub const KIND_MESSAGE_BLOCKED: u16 = 31;
+pub const KIND_CHANNEL_CREATED: u16 = 32;
+pub const KIND_CHANNEL_CLOSED: u16 = 33;
 
 // Reserved high kinds
 pub const KIND_RUN_STARTED: u16 = 0xFFFE;

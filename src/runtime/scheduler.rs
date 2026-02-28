@@ -11,11 +11,19 @@ use super::event::{FuelReason, SchedState, YieldKind};
 use super::event_recorder::EventRecorder;
 
 pub type TaskId = u32;
+pub type AgentId = u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockReason {
+    Join { target: TaskId },
+    Recv { agent: AgentId },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskStatus {
     Runnable,
     BlockedJoin { target: TaskId },
+    BlockedRecv { agent: AgentId },
     Canceled,
     Finished { exit_code: i32 },
 }
@@ -73,6 +81,7 @@ pub struct Scheduler {
     pub runnable: BTreeSet<TaskId>,
     pub tasks: BTreeMap<TaskId, TaskState>,
     pub join_waiters: BTreeMap<TaskId, BTreeSet<TaskId>>,
+    pub recv_waiters: BTreeMap<AgentId, BTreeSet<TaskId>>,
     pub blocked: BTreeSet<TaskId>,
 }
 
@@ -84,6 +93,7 @@ impl Scheduler {
             runnable: BTreeSet::new(),
             tasks: BTreeMap::new(),
             join_waiters: BTreeMap::new(),
+            recv_waiters: BTreeMap::new(),
             blocked: BTreeSet::new(),
         }
     }
@@ -165,6 +175,52 @@ impl Scheduler {
         self.runnable.remove(&waiter);
         self.blocked.insert(waiter);
         self.join_waiters.entry(target).or_default().insert(waiter);
+    }
+
+    pub fn block_on_recv(&mut self, task: TaskId, agent: AgentId) -> bool {
+        let Some(task_state) = self.tasks.get(&task) else {
+            return false;
+        };
+        if !matches!(task_state.status, TaskStatus::Runnable) {
+            return false;
+        }
+
+        if let Some(task_state) = self.tasks.get_mut(&task) {
+            task_state.status = TaskStatus::BlockedRecv { agent };
+        }
+
+        self.runnable.remove(&task);
+        self.blocked.insert(task);
+        self.remove_waiter_from_all(task);
+        self.recv_waiters.entry(agent).or_default().insert(task);
+        true
+    }
+
+    pub fn wake_recv_waiters(&mut self, agent: AgentId) -> Vec<TaskId> {
+        let Some(waiters) = self.recv_waiters.remove(&agent) else {
+            return Vec::new();
+        };
+
+        let mut woken = Vec::new();
+        for waiter in waiters {
+            let Some(state) = self.tasks.get_mut(&waiter) else {
+                continue;
+            };
+
+            match state.status {
+                TaskStatus::BlockedRecv {
+                    agent: blocked_agent,
+                } if blocked_agent == agent => {
+                    state.status = TaskStatus::Runnable;
+                    self.blocked.remove(&waiter);
+                    self.runnable.insert(waiter);
+                    woken.push(waiter);
+                }
+                _ => {}
+            }
+        }
+
+        woken
     }
 
     pub fn mark_finished(&mut self, task: TaskId, exit_code: i32) {
@@ -302,6 +358,34 @@ impl Scheduler {
         })
     }
 
+    pub fn has_unfinished_tasks(&self) -> bool {
+        self.tasks.values().any(|state| {
+            !matches!(
+                state.status,
+                TaskStatus::Finished { .. } | TaskStatus::Canceled
+            )
+        })
+    }
+
+    pub fn blocked_snapshot(&self) -> Vec<(TaskId, BlockReason)> {
+        let mut out = Vec::new();
+        for task in &self.blocked {
+            let Some(state) = self.tasks.get(task) else {
+                continue;
+            };
+            match state.status {
+                TaskStatus::BlockedJoin { target } => {
+                    out.push((*task, BlockReason::Join { target }));
+                }
+                TaskStatus::BlockedRecv { agent } => {
+                    out.push((*task, BlockReason::Recv { agent }));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
     pub fn reevaluate_with_log(&mut self, log: &mut dyn SchedLog) {
         if self.state == SchedState::Running && self.runnable.is_empty() {
             self.transition_state(SchedState::Draining, log);
@@ -336,6 +420,16 @@ impl Scheduler {
                 waiters.remove(&waiter);
                 if waiters.is_empty() {
                     self.join_waiters.remove(&target);
+                }
+            }
+        }
+
+        let agents: Vec<AgentId> = self.recv_waiters.keys().copied().collect();
+        for agent in agents {
+            if let Some(waiters) = self.recv_waiters.get_mut(&agent) {
+                waiters.remove(&waiter);
+                if waiters.is_empty() {
+                    self.recv_waiters.remove(&agent);
                 }
             }
         }
@@ -450,5 +544,55 @@ mod tests {
         assert_eq!(log.tick_starts, vec![0, 1]);
         assert_eq!(log.tick_ends, vec![0, 1]);
         assert_eq!(s.tick, 2);
+    }
+
+    #[test]
+    fn test_recv_block_and_single_wake() {
+        let mut s = Scheduler::new();
+        s.init_root(0);
+        let recv_task = s.spawn_child(0);
+
+        assert!(s.block_on_recv(recv_task, 42));
+        assert!(s.runnable.get(&recv_task).is_none());
+        assert!(s.blocked.contains(&recv_task));
+        assert!(matches!(
+            s.tasks.get(&recv_task).map(|st| &st.status),
+            Some(TaskStatus::BlockedRecv { agent: 42 })
+        ));
+
+        let woken = s.wake_recv_waiters(42);
+        assert_eq!(woken, vec![recv_task]);
+        assert!(s.runnable.contains(&recv_task));
+        assert!(!s.blocked.contains(&recv_task));
+    }
+
+    #[test]
+    fn test_recv_wake_order_is_ascending() {
+        let mut s = Scheduler::new();
+        s.init_root(0);
+        let waiter_a = s.spawn_child(0);
+        let waiter_b = s.spawn_child(0);
+
+        assert!(s.block_on_recv(waiter_b, 7));
+        assert!(s.block_on_recv(waiter_a, 7));
+
+        let woken = s.wake_recv_waiters(7);
+        assert_eq!(woken, vec![waiter_a, waiter_b]);
+    }
+
+    #[test]
+    fn test_blocked_snapshot_is_sorted_and_stable() {
+        let mut s = Scheduler::new();
+        s.init_root(0);
+        let t1 = s.spawn_child(0);
+        let t2 = s.spawn_child(0);
+
+        s.block_on_recv(t2, 9);
+        s.request_join(t1, t2);
+
+        let snapshot = s.blocked_snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0], (t1, BlockReason::Join { target: t2 }));
+        assert_eq!(snapshot[1], (t2, BlockReason::Recv { agent: 9 }));
     }
 }

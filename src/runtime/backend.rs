@@ -9,17 +9,29 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::event::{FuelReason, SchedState, YieldKind};
 use super::event_recorder::try_recorder;
-use super::scheduler::{NoopSchedLog, SchedLog, Scheduler};
+use super::scheduler::{AgentId, BlockReason, NoopSchedLog, SchedLog, Scheduler};
 use super::task_context::TaskId;
 
 const COOP_INITIAL_FUEL: u64 = 1024;
 const COOP_DEBIT_TICK: u32 = 1;
 const COOP_DEBIT_STEP: u32 = 4;
 const COOP_EXIT_FUEL_EXHAUSTED: i32 = 70;
+const COOP_EXIT_DEADLOCK: i32 = 75;
+
+const DEADLOCK_KIND_JOIN_CYCLE: u8 = 1;
+const DEADLOCK_KIND_RECV_ONLY: u8 = 2;
+const DEADLOCK_KIND_MIXED: u8 = 3;
+const DEADLOCK_KIND_UNRESOLVED: u8 = 4;
+
+const DEADLOCK_REASON_JOIN_WAIT: u8 = 1;
+const DEADLOCK_REASON_RECV_WAIT: u8 = 2;
+const DEADLOCK_REASON_CYCLE_EDGE: u8 = 3;
 
 pub trait ExecBackend {
     fn spawn(&mut self, parent: TaskId) -> TaskId;
     fn request_join(&mut self, waiter: TaskId, target: TaskId);
+    fn block_on_recv(&mut self, task: TaskId, agent: AgentId);
+    fn wake_recv_waiters(&mut self, agent: AgentId) -> Vec<TaskId>;
     fn cancel_bfs(&mut self, root: TaskId) -> Vec<TaskId>;
     fn tick_or_step(&mut self);
 
@@ -66,6 +78,12 @@ impl ExecBackend for ThreadedBackend {
             return;
         }
         self.join_waiters.entry(target).or_default().insert(waiter);
+    }
+
+    fn block_on_recv(&mut self, _task: TaskId, _agent: AgentId) {}
+
+    fn wake_recv_waiters(&mut self, _agent: AgentId) -> Vec<TaskId> {
+        Vec::new()
     }
 
     fn cancel_bfs(&mut self, root: TaskId) -> Vec<TaskId> {
@@ -115,12 +133,29 @@ impl ExecBackend for ThreadedBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeadlockEdge {
+    from: u32,
+    to: u32,
+    reason: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DeadlockReport {
+    tick: u64,
+    blocked_count: u32,
+    kind: u8,
+    edges: Vec<DeadlockEdge>,
+    cycle: Vec<u32>,
+}
+
 pub struct CoopBackend {
     scheduler: Scheduler,
     last_picked: Option<TaskId>,
     fuel_remaining: u64,
     exhausted: bool,
     forced_exit: Option<i32>,
+    deadlock_report: Option<DeadlockReport>,
 }
 
 impl CoopBackend {
@@ -131,6 +166,7 @@ impl CoopBackend {
             fuel_remaining: COOP_INITIAL_FUEL,
             exhausted: false,
             forced_exit: None,
+            deadlock_report: None,
         }
     }
 
@@ -202,6 +238,111 @@ impl CoopBackend {
             scheduler.force_finish_with_log(log);
         });
     }
+
+    fn maybe_trigger_deadlock(&mut self) {
+        if self.exhausted || self.scheduler.state == SchedState::Finished {
+            return;
+        }
+
+        if !self.scheduler.runnable.is_empty() {
+            return;
+        }
+
+        if !self.scheduler.has_unfinished_tasks() {
+            return;
+        }
+
+        let blocked_snapshot = self.scheduler.blocked_snapshot();
+        let blocked_count = blocked_snapshot.len() as u32;
+
+        let mut join_edges = BTreeMap::new();
+        let mut recv_only = !blocked_snapshot.is_empty();
+        let mut edges: Vec<DeadlockEdge> = Vec::new();
+
+        for (task, reason) in &blocked_snapshot {
+            match reason {
+                BlockReason::Join { target } => {
+                    recv_only = false;
+                    join_edges.insert(*task, *target);
+                    edges.push(DeadlockEdge {
+                        from: *task,
+                        to: *target,
+                        reason: DEADLOCK_REASON_JOIN_WAIT,
+                    });
+                }
+                BlockReason::Recv { agent } => {
+                    edges.push(DeadlockEdge {
+                        from: *task,
+                        to: *agent,
+                        reason: DEADLOCK_REASON_RECV_WAIT,
+                    });
+                }
+            }
+        }
+
+        let cycle = find_smallest_join_cycle(&join_edges).unwrap_or_default();
+        if cycle.len() >= 2 {
+            for idx in 0..cycle.len() {
+                let next = if idx + 1 < cycle.len() {
+                    cycle[idx + 1]
+                } else {
+                    cycle[0]
+                };
+                edges.push(DeadlockEdge {
+                    from: cycle[idx],
+                    to: next,
+                    reason: DEADLOCK_REASON_CYCLE_EDGE,
+                });
+            }
+        }
+
+        let kind = if !cycle.is_empty() {
+            DEADLOCK_KIND_JOIN_CYCLE
+        } else if recv_only {
+            DEADLOCK_KIND_RECV_ONLY
+        } else if blocked_snapshot.is_empty() {
+            DEADLOCK_KIND_UNRESOLVED
+        } else {
+            DEADLOCK_KIND_MIXED
+        };
+
+        let report = DeadlockReport {
+            tick: self.scheduler.tick,
+            blocked_count,
+            kind,
+            edges,
+            cycle,
+        };
+
+        if let Some(rec) = try_recorder() {
+            if let Ok(mut guard) = rec.lock() {
+                let _ = guard.record_deadlock_detected(
+                    0,
+                    report.tick,
+                    report.blocked_count,
+                    report.kind,
+                );
+                for edge in &report.edges {
+                    let _ = guard.record_deadlock_edge(0, edge.from, edge.to, edge.reason);
+                }
+            }
+        }
+
+        self.deadlock_report = Some(report);
+        self.exhausted = true;
+        self.forced_exit = Some(COOP_EXIT_DEADLOCK);
+
+        self.with_sched_log(|scheduler, log| {
+            scheduler.reevaluate_with_log(log);
+            scheduler.force_finish_with_log(log);
+        });
+        self.last_picked = None;
+    }
+
+    #[cfg(test)]
+    fn deadlock_report(&self) -> Option<&DeadlockReport> {
+        self.deadlock_report.as_ref()
+    }
 }
 
 impl ExecBackend for CoopBackend {
@@ -219,6 +360,42 @@ impl ExecBackend for CoopBackend {
     fn request_join(&mut self, waiter: TaskId, target: TaskId) {
         self.scheduler
             .request_join(Self::to_sched_id(waiter), Self::to_sched_id(target));
+    }
+
+    fn block_on_recv(&mut self, task: TaskId, agent: AgentId) {
+        if self.scheduler.state == SchedState::Finished || self.exhausted {
+            return;
+        }
+
+        let task_u32 = Self::to_sched_id(task);
+        if !self.scheduler.block_on_recv(task_u32, agent) {
+            return;
+        }
+
+        if let Some(rec) = try_recorder() {
+            if let Ok(mut guard) = rec.lock() {
+                let _ =
+                    guard.record_yield(0, self.scheduler.tick, task_u32, YieldKind::RecvBlocked);
+            }
+        }
+
+        self.with_sched_log(|scheduler, log| {
+            scheduler.reevaluate_with_log(log);
+        });
+        self.last_picked = None;
+    }
+
+    fn wake_recv_waiters(&mut self, agent: AgentId) -> Vec<TaskId> {
+        let mut woken = Vec::new();
+        self.with_sched_log(|scheduler, log| {
+            woken = scheduler
+                .wake_recv_waiters(agent)
+                .into_iter()
+                .map(u64::from)
+                .collect();
+            scheduler.reevaluate_with_log(log);
+        });
+        woken
     }
 
     fn cancel_bfs(&mut self, root: TaskId) -> Vec<TaskId> {
@@ -267,6 +444,7 @@ impl ExecBackend for CoopBackend {
                     scheduler.force_finish_with_log(log);
                 }
             });
+            self.maybe_trigger_deadlock();
         }
     }
 
@@ -307,6 +485,58 @@ impl ExecBackend for CoopBackend {
     }
 }
 
+fn find_smallest_join_cycle(join_edges: &BTreeMap<u32, u32>) -> Option<Vec<u32>> {
+    let mut best: Option<Vec<u32>> = None;
+
+    for root in join_edges.keys() {
+        let mut path: Vec<u32> = Vec::new();
+        let mut seen_at: BTreeMap<u32, usize> = BTreeMap::new();
+        let mut current = *root;
+
+        loop {
+            if let Some(idx) = seen_at.get(&current).copied() {
+                let cycle = normalize_cycle(&path[idx..]);
+                if !cycle.is_empty() {
+                    match &best {
+                        Some(prev) if *prev <= cycle => {}
+                        _ => best = Some(cycle),
+                    }
+                }
+                break;
+            }
+
+            let Some(next) = join_edges.get(&current).copied() else {
+                break;
+            };
+
+            seen_at.insert(current, path.len());
+            path.push(current);
+            current = next;
+        }
+    }
+
+    best
+}
+
+fn normalize_cycle(cycle: &[u32]) -> Vec<u32> {
+    if cycle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut best: Option<Vec<u32>> = None;
+    for offset in 0..cycle.len() {
+        let mut rotated = Vec::with_capacity(cycle.len());
+        rotated.extend_from_slice(&cycle[offset..]);
+        rotated.extend_from_slice(&cycle[..offset]);
+        match &best {
+            Some(prev) if *prev <= rotated => {}
+            _ => best = Some(rotated),
+        }
+    }
+
+    best.unwrap_or_default()
+}
+
 pub enum BackendKind {
     Threaded(ThreadedBackend),
     Coop(CoopBackend),
@@ -337,6 +567,20 @@ impl ExecBackend for BackendKind {
         match self {
             BackendKind::Threaded(b) => b.request_join(waiter, target),
             BackendKind::Coop(b) => b.request_join(waiter, target),
+        }
+    }
+
+    fn block_on_recv(&mut self, task: TaskId, agent: AgentId) {
+        match self {
+            BackendKind::Threaded(b) => b.block_on_recv(task, agent),
+            BackendKind::Coop(b) => b.block_on_recv(task, agent),
+        }
+    }
+
+    fn wake_recv_waiters(&mut self, agent: AgentId) -> Vec<TaskId> {
+        match self {
+            BackendKind::Threaded(b) => b.wake_recv_waiters(agent),
+            BackendKind::Coop(b) => b.wake_recv_waiters(agent),
         }
     }
 
@@ -392,7 +636,16 @@ impl ExecBackend for BackendKind {
 
 #[cfg(all(test, feature = "coop_scheduler"))]
 mod tests {
-    use super::{CoopBackend, ExecBackend, COOP_EXIT_FUEL_EXHAUSTED};
+    use super::{
+        CoopBackend, ExecBackend, COOP_EXIT_DEADLOCK, COOP_EXIT_FUEL_EXHAUSTED,
+        DEADLOCK_KIND_JOIN_CYCLE, DEADLOCK_KIND_MIXED, DEADLOCK_KIND_RECV_ONLY,
+        DEADLOCK_REASON_JOIN_WAIT, DEADLOCK_REASON_RECV_WAIT,
+    };
+    use crate::runtime::agent_bus::{Mailbox, Message};
+    use crate::runtime::event_reader::{EventReader, KIND_BUS_RECV, LOG_HEADER_LEN};
+    use crate::runtime::event_recorder::EventRecorder;
+    use std::fs;
+    use std::io::BufReader;
 
     #[test]
     fn coop_spawn_order_is_stable() {
@@ -468,5 +721,180 @@ mod tests {
 
         assert_eq!(b.forced_exit_code(), Some(COOP_EXIT_FUEL_EXHAUSTED));
         assert!(b.is_finished());
+    }
+
+    #[test]
+    fn coop_recv_blocks_until_send() {
+        let mut b = CoopBackend::new();
+        let receiver_task = b.spawn(0);
+        let sender_task = b.spawn(0);
+        let receiver_agent = 42u32;
+
+        let mut mailbox = Mailbox::new();
+        assert!(mailbox.recv(receiver_agent).message.is_none());
+
+        b.block_on_recv(receiver_task, receiver_agent);
+
+        for _ in 0..2 {
+            b.run();
+            if let Some(task) = b.take_picked() {
+                assert_ne!(task, receiver_task);
+                b.complete(task, 0);
+            }
+        }
+
+        let base = std::env::temp_dir().join("nex_coop_recv_blocks_until_send");
+        let out_dir = base.join("out");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&out_dir).expect("create out dir");
+
+        let mut rec = EventRecorder::open(&out_dir, "events.bin").expect("open recorder");
+        rec.record_task_started(0).expect("record task started");
+
+        let send_out = mailbox.send(
+            7,
+            receiver_agent,
+            Message {
+                req_id: 0,
+                channel_id: 0,
+                sender: 0,
+                sender_seq: 1,
+                seq: 1,
+                kind: 99,
+                schema_id: 1,
+                payload: Vec::new(),
+            },
+        );
+        rec.record_bus_send(0, send_out.req_id, 7, receiver_agent, 99, 0, 0)
+            .expect("record bus send");
+
+        let woken = b.wake_recv_waiters(receiver_agent);
+        assert_eq!(woken, vec![receiver_task]);
+
+        b.run();
+        let picked = b.take_picked();
+        assert_eq!(picked, Some(receiver_task));
+        b.complete(receiver_task, 0);
+        b.complete(sender_task, 0);
+
+        let received = mailbox
+            .recv(receiver_agent)
+            .message
+            .expect("receiver should consume queued message");
+        assert_eq!(received.req_id, send_out.req_id);
+        rec.record_bus_recv(0, received.req_id, receiver_agent)
+            .expect("record bus recv");
+        rec.record_task_finished(0, 0)
+            .expect("record task finished");
+        rec.record_run_finished(0, 0).expect("record run finished");
+        drop(rec);
+
+        let events_path = out_dir.join("events.bin");
+        let file = fs::File::open(&events_path).expect("open events");
+        let mut reader = EventReader::new(BufReader::new(file));
+        reader.read_log_header().expect("header");
+
+        let mut saw_bus_recv = false;
+        while let Some(ev) = reader.read_next().expect("read event") {
+            if ev.kind == KIND_BUS_RECV {
+                saw_bus_recv = true;
+                break;
+            }
+        }
+
+        assert_eq!(LOG_HEADER_LEN, 76);
+        assert!(saw_bus_recv, "BusRecv event should be present");
+    }
+
+    #[test]
+    fn coop_recv_wake_order_is_stable() {
+        let mut b = CoopBackend::new();
+        let waiter_a = b.spawn(0);
+        let waiter_b = b.spawn(0);
+        let agent = 9u32;
+
+        b.block_on_recv(waiter_b, agent);
+        b.block_on_recv(waiter_a, agent);
+
+        let woken = b.wake_recv_waiters(agent);
+        assert_eq!(woken, vec![waiter_a, waiter_b]);
+    }
+
+    #[test]
+    fn join_cycle_deadlock_detected() {
+        let mut b = CoopBackend::new();
+        let t1 = b.spawn(0);
+        let t2 = b.spawn(0);
+
+        b.request_join(0, t1);
+        b.request_join(t1, t2);
+        b.request_join(t2, t1);
+
+        b.run();
+
+        assert!(b.take_picked().is_none());
+        assert_eq!(b.forced_exit_code(), Some(COOP_EXIT_DEADLOCK));
+        assert!(b.is_finished());
+
+        let report = b.deadlock_report().expect("deadlock report");
+        assert_eq!(report.kind, DEADLOCK_KIND_JOIN_CYCLE);
+        assert_eq!(report.blocked_count, 3);
+        assert_eq!(report.cycle, vec![1, 2]);
+    }
+
+    #[test]
+    fn recv_only_deadlock_detected() {
+        let mut b = CoopBackend::new();
+        let t1 = b.spawn(0);
+
+        b.block_on_recv(0, 10);
+        b.block_on_recv(t1, 11);
+
+        b.run();
+
+        assert!(b.take_picked().is_none());
+        assert_eq!(b.forced_exit_code(), Some(COOP_EXIT_DEADLOCK));
+
+        let report = b.deadlock_report().expect("deadlock report");
+        assert_eq!(report.kind, DEADLOCK_KIND_RECV_ONLY);
+        assert_eq!(report.blocked_count, 2);
+    }
+
+    #[test]
+    fn report_is_deterministic() {
+        let mut b = CoopBackend::new();
+        let t1 = b.spawn(0);
+        let t2 = b.spawn(0);
+        let t3 = b.spawn(0);
+
+        b.block_on_recv(t3, 7);
+        b.request_join(t2, t1);
+        b.block_on_recv(t1, 8);
+        b.request_join(0, t3);
+
+        b.run();
+
+        let report = b.deadlock_report().expect("deadlock report");
+        assert_eq!(report.kind, DEADLOCK_KIND_MIXED);
+        assert_eq!(report.blocked_count, 4);
+
+        let blocked_edges: Vec<(u32, u32, u8)> = report
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.reason == DEADLOCK_REASON_JOIN_WAIT || edge.reason == DEADLOCK_REASON_RECV_WAIT
+            })
+            .map(|edge| (edge.from, edge.to, edge.reason))
+            .collect();
+
+        assert_eq!(
+            blocked_edges,
+            vec![
+                (0, t3 as u32, DEADLOCK_REASON_JOIN_WAIT),
+                (t1 as u32, 8, DEADLOCK_REASON_RECV_WAIT),
+                (t2 as u32, t1 as u32, DEADLOCK_REASON_JOIN_WAIT),
+                (t3 as u32, 7, DEADLOCK_REASON_RECV_WAIT),
+            ]
+        );
     }
 }
