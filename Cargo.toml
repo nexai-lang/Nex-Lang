@@ -15,3 +15,15 @@ hex = "0.4"
 rand = "0.8"
 base64 = "0.22"
 ed25519-dalek = "2"
+[workspace]
+resolver = "2"
+members = [
+  "crates/nex-cli",
+  "crates/nex-lexer",
+  "crates/nex-parser",
+  "crates/nex-checker",
+  "crates/nex-codegen",
+  "crates/nex-runtime",
+  "crates/nex-log",
+  "crates/nex-crypto",
+]
