@@ -179,10 +179,14 @@ impl<R: Read> EventReader<R> {
             Err(e) => return Err(e),
         }
 
-        let seq = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
-        let task_id = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-        let kind = u16::from_le_bytes(hdr[16..18].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(hdr[18..22].try_into().unwrap()) as usize;
+        let seq = u64::from_le_bytes([
+            hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7],
+        ]);
+        let task_id = u64::from_le_bytes([
+            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+        ]);
+        let kind = u16::from_le_bytes([hdr[16], hdr[17]]);
+        let payload_len = u32::from_le_bytes([hdr[18], hdr[19], hdr[20], hdr[21]]) as usize;
 
         if payload_len > 16 * 1024 * 1024 {
             return Err(io::Error::new(
@@ -209,5 +213,117 @@ impl EventReader<BufReader<File>> {
     pub fn open(path: &Path) -> io::Result<Self> {
         let f = File::open(path)?;
         Ok(EventReader::new(BufReader::new(f)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn build_log_header(flags: u16) -> [u8; LOG_HEADER_LEN] {
+        let mut header = [0u8; LOG_HEADER_LEN];
+        header[0..4].copy_from_slice(&LOG_MAGIC);
+        header[4..6].copy_from_slice(&LOG_VERSION.to_le_bytes());
+        header[70..72].copy_from_slice(&flags.to_le_bytes());
+        let crc = crc32_ieee(&header[0..72]);
+        header[72..76].copy_from_slice(&crc.to_le_bytes());
+        header
+    }
+
+    fn encode_record(seq: u64, task_id: u64, kind: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&task_id.to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn read_next_rejects_oversize_payload_len() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&build_log_header(0));
+
+        let mut rec = Vec::new();
+        rec.extend_from_slice(&0u64.to_le_bytes());
+        rec.extend_from_slice(&0u64.to_le_bytes());
+        rec.extend_from_slice(&KIND_TASK_STARTED.to_le_bytes());
+        rec.extend_from_slice(&((16 * 1024 * 1024 + 1) as u32).to_le_bytes());
+        bytes.extend_from_slice(&rec);
+
+        let mut reader = EventReader::new(Cursor::new(bytes));
+        reader.read_log_header().expect("header should parse");
+
+        let err = reader
+            .read_next()
+            .expect_err("oversize payload_len must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("payload_len too large"));
+    }
+
+    #[test]
+    fn read_next_rejects_truncated_record_payload() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&build_log_header(0));
+
+        let payload = [1u8, 2, 3, 4];
+        let mut rec = encode_record(1, 0, KIND_TASK_STARTED, &payload);
+        rec.pop();
+        bytes.extend_from_slice(&rec);
+
+        let mut reader = EventReader::new(Cursor::new(bytes));
+        reader.read_log_header().expect("header should parse");
+
+        let err = reader
+            .read_next()
+            .expect_err("truncated record payload must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn hostile_streams_never_panic() {
+        let mut seed: u64 = 0xD00D_F00D_1234_5678;
+        let mut corpus: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0],
+            vec![0x4E, 0x45, 0x58],
+            b"NEXL".to_vec(),
+            build_log_header(0).to_vec(),
+        ];
+
+        for i in 0..64usize {
+            let len = (i * 13) % 257;
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                v.push((seed & 0xFF) as u8);
+            }
+            corpus.push(v);
+        }
+
+        for (idx, bytes) in corpus.iter().enumerate() {
+            let caught = std::panic::catch_unwind(|| {
+                let mut reader = EventReader::new(Cursor::new(bytes.clone()));
+                if reader.read_log_header().is_ok() {
+                    loop {
+                        match reader.read_next() {
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
+
+            assert!(
+                caught.is_ok(),
+                "event_reader panicked on hostile input case {}",
+                idx
+            );
+        }
     }
 }

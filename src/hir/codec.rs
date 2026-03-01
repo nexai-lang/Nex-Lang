@@ -7,6 +7,9 @@ use super::HIR_VERSION;
 
 pub const HIR_MAGIC: [u8; 8] = *b"NEXHIR\0\0";
 
+const MAX_COLLECTION_LEN: usize = 1_000_000;
+const MAX_STRING_LEN: usize = 1_000_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {
     UnexpectedEof {
@@ -29,6 +32,11 @@ pub enum DecodeError {
     LengthOverflow {
         context: &'static str,
         value: u64,
+    },
+    LengthLimitExceeded {
+        context: &'static str,
+        value: u64,
+        limit: usize,
     },
     IntegerOverflow {
         context: &'static str,
@@ -65,6 +73,15 @@ impl fmt::Display for DecodeError {
             DecodeError::LengthOverflow { context, value } => {
                 write!(f, "length overflow in {}: {}", context, value)
             }
+            DecodeError::LengthLimitExceeded {
+                context,
+                value,
+                limit,
+            } => write!(
+                f,
+                "length exceeds limit in {}: {} (limit: {})",
+                context, value, limit
+            ),
             DecodeError::IntegerOverflow { context, value } => {
                 write!(f, "integer overflow in {}: {}", context, value)
             }
@@ -884,6 +901,13 @@ impl<'a> Reader<'a> {
 
     fn read_len(&mut self, context: &'static str) -> Result<usize, DecodeError> {
         let raw = self.read_u64()?;
+        if raw > MAX_COLLECTION_LEN as u64 {
+            return Err(DecodeError::LengthLimitExceeded {
+                context,
+                value: raw,
+                limit: MAX_COLLECTION_LEN,
+            });
+        }
         usize::try_from(raw).map_err(|_| DecodeError::LengthOverflow {
             context,
             value: raw,
@@ -891,7 +915,20 @@ impl<'a> Reader<'a> {
     }
 
     fn read_string(&mut self, context: &'static str) -> Result<String, DecodeError> {
-        let len = self.read_len(context)?;
+        let raw = self.read_u64()?;
+        if raw > MAX_STRING_LEN as u64 {
+            return Err(DecodeError::LengthLimitExceeded {
+                context,
+                value: raw,
+                limit: MAX_STRING_LEN,
+            });
+        }
+
+        let len = usize::try_from(raw).map_err(|_| DecodeError::LengthOverflow {
+            context,
+            value: raw,
+        })?;
+
         let bytes = self.take(len)?;
         let s = std::str::from_utf8(bytes).map_err(|_| DecodeError::InvalidUtf8 { context })?;
         Ok(s.to_owned())
@@ -1080,6 +1117,29 @@ mod tests {
         let err = types::Program::decode(&bytes).expect_err("decode must reject bad magic");
         assert_eq!(err, DecodeError::InvalidMagic);
         assert_eq!(err.to_string(), "invalid HIR magic");
+    }
+
+    #[test]
+    fn decode_rejects_oversize_length_fail_closed() {
+        let src = r#"
+            fn main() {
+                return;
+            }
+        "#;
+
+        let mut bytes = parse_and_lower(src).encode();
+        bytes[12..20].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let err = types::Program::decode(&bytes)
+            .expect_err("decode must reject oversized collection lengths");
+        assert_eq!(
+            err,
+            DecodeError::LengthLimitExceeded {
+                context: "program.items",
+                value: u64::MAX,
+                limit: 1_000_000,
+            }
+        );
     }
 
     fn parse_and_lower(source: &str) -> types::Program {

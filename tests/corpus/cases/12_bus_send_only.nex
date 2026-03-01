@@ -1,0 +1,5 @@
+fn main() {
+    bus.channel("metrics", "MetricV1");
+    bus.send("metrics", "MetricV1", "1");
+    return;
+}

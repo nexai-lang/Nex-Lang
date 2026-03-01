@@ -1,0 +1,1 @@
+mir-check violation [MIR-E2004] at line 1, col 4 in fn main: return type mismatch: expected int, got void

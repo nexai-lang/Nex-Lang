@@ -1,0 +1,6 @@
+fn main() {
+    bus.channel("alerts", "AlertV1");
+    bus.send("alerts", "AlertV1", "payload");
+    bus.recv("alerts");
+    return;
+}

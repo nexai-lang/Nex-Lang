@@ -1,0 +1,8 @@
+fn main() {
+    let ch: str = "alerts";
+    if false {
+        bus.recv(ch);
+    } else {
+        return;
+    }
+}

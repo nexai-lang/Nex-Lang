@@ -1,0 +1,5 @@
+cap fs.read("tests/corpus/runtime/*");
+
+fn main() !io {
+    return;
+}

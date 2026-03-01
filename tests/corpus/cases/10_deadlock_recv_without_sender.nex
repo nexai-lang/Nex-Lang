@@ -1,0 +1,7 @@
+fn main() {
+    if false {
+        bus.recv("deadlock");
+    } else {
+        return;
+    }
+}

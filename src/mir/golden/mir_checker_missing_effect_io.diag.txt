@@ -1,0 +1,1 @@
+mir-check violation [MIR-E1001] at line 1, col 4 in fn helper: missing required effect declaration `!io` (required by body or callees)

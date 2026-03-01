@@ -1,0 +1,13 @@
+cap fs.read("tests/corpus/runtime/*");
+
+fn worker() !io {
+    return;
+}
+
+fn main() !io !async {
+    let t = spawn {
+        worker();
+    };
+    join(t);
+    return;
+}

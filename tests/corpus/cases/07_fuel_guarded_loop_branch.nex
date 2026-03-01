@@ -1,0 +1,9 @@
+fn main() {
+    if false {
+        loop {
+            fuel.consume(1);
+        }
+    } else {
+        return;
+    }
+}

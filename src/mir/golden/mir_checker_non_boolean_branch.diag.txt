@@ -1,0 +1,1 @@
+mir-check violation [MIR-E2003] at line 1, col 4 in fn main: branch condition must be bool, got int

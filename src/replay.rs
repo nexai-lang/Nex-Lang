@@ -115,6 +115,38 @@ fn err_invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
+fn read_u16_le_at(payload: &[u8], off: usize, field: &str) -> io::Result<u16> {
+    let end = off
+        .checked_add(2)
+        .ok_or_else(|| err_invalid(format!("{} offset overflow", field)))?;
+    let bytes = payload
+        .get(off..end)
+        .ok_or_else(|| err_invalid(format!("{} out of bounds", field)))?;
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u32_le_at(payload: &[u8], off: usize, field: &str) -> io::Result<u32> {
+    let end = off
+        .checked_add(4)
+        .ok_or_else(|| err_invalid(format!("{} offset overflow", field)))?;
+    let bytes = payload
+        .get(off..end)
+        .ok_or_else(|| err_invalid(format!("{} out of bounds", field)))?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_u64_le_at(payload: &[u8], off: usize, field: &str) -> io::Result<u64> {
+    let end = off
+        .checked_add(8)
+        .ok_or_else(|| err_invalid(format!("{} offset overflow", field)))?;
+    let bytes = payload
+        .get(off..end)
+        .ok_or_else(|| err_invalid(format!("{} out of bounds", field)))?;
+    Ok(u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]))
+}
+
 fn is_scheduler_kind(kind: u16) -> bool {
     matches!(
         kind,
@@ -137,7 +169,7 @@ fn decode_sched_init_tick(payload: &[u8]) -> io::Result<u64> {
             payload.len()
         )));
     }
-    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+    read_u64_le_at(payload, 0, "SchedInit.tick")
 }
 
 fn decode_sched_state(payload: &[u8]) -> io::Result<(SchedState, SchedState, u64)> {
@@ -152,7 +184,7 @@ fn decode_sched_state(payload: &[u8]) -> io::Result<(SchedState, SchedState, u64
         .ok_or_else(|| err_invalid(format!("invalid SchedState.from {}", payload[0])))?;
     let to = SchedState::from_u8(payload[1])
         .ok_or_else(|| err_invalid(format!("invalid SchedState.to {}", payload[1])))?;
-    let tick = u64::from_le_bytes(payload[2..10].try_into().unwrap());
+    let tick = read_u64_le_at(payload, 2, "SchedState.tick")?;
 
     Ok((from, to, tick))
 }
@@ -164,7 +196,7 @@ fn decode_tick_start(payload: &[u8]) -> io::Result<u64> {
             payload.len()
         )));
     }
-    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+    read_u64_le_at(payload, 0, "TickStart.tick")
 }
 
 fn decode_tick_end(payload: &[u8]) -> io::Result<u64> {
@@ -174,7 +206,7 @@ fn decode_tick_end(payload: &[u8]) -> io::Result<u64> {
             payload.len()
         )));
     }
-    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+    read_u64_le_at(payload, 0, "TickEnd.tick")
 }
 
 fn decode_pick_task(payload: &[u8]) -> io::Result<(u64, u64)> {
@@ -185,7 +217,7 @@ fn decode_pick_task(payload: &[u8]) -> io::Result<(u64, u64)> {
         )));
     }
 
-    let reason_len = u16::from_le_bytes(payload[12..14].try_into().unwrap()) as usize;
+    let reason_len = read_u16_le_at(payload, 12, "PickTask.reason_len")? as usize;
     if payload.len() != 14 + reason_len {
         return Err(err_invalid(format!(
             "Bad PickTask payload length mismatch: expected {}, got {}",
@@ -194,8 +226,8 @@ fn decode_pick_task(payload: &[u8]) -> io::Result<(u64, u64)> {
         )));
     }
 
-    let tick = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let task_id_u32 = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let tick = read_u64_le_at(payload, 0, "PickTask.tick")?;
+    let task_id_u32 = read_u32_le_at(payload, 8, "PickTask.task_id")?;
 
     Ok((tick, u64::from(task_id_u32)))
 }
@@ -208,8 +240,8 @@ fn decode_yield(payload: &[u8]) -> io::Result<(u64, u64, YieldKind)> {
         )));
     }
 
-    let tick = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let task_id_u32 = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let tick = read_u64_le_at(payload, 0, "Yield.tick")?;
+    let task_id_u32 = read_u32_le_at(payload, 8, "Yield.task_id")?;
     let kind = YieldKind::from_u8(payload[12])
         .ok_or_else(|| err_invalid(format!("invalid Yield.kind {}", payload[12])))?;
 
@@ -223,14 +255,14 @@ fn decode_fuel_debit_tick(payload: &[u8]) -> io::Result<u64> {
             payload.len()
         )));
     }
-    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+    read_u64_le_at(payload, 0, "FuelDebit.tick")
 }
 
 fn decode_io_request(payload: &[u8]) -> io::Result<(u64, u8)> {
     if payload.len() >= 11 {
-        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let req_id = read_u64_le_at(payload, 0, "IoRequest.req_id")?;
         let maybe_kind = payload[8];
-        let path_len = u16::from_le_bytes(payload[9..11].try_into().unwrap()) as usize;
+        let path_len = read_u16_le_at(payload, 9, "IoRequest.path_len")? as usize;
         if payload.len() == 11 + path_len
             && matches!(
                 maybe_kind,
@@ -251,7 +283,7 @@ fn decode_io_request(payload: &[u8]) -> io::Result<(u64, u8)> {
             payload.len()
         )));
     }
-    let path_len = u16::from_le_bytes(payload[1..3].try_into().unwrap()) as usize;
+    let path_len = read_u16_le_at(payload, 1, "IoRequest.path_len_legacy")? as usize;
     if payload.len() != 3 + path_len {
         return Err(err_invalid(format!(
             "Bad IoRequest payload length mismatch: expected {}, got {}",
@@ -273,18 +305,18 @@ fn decode_io_begin(payload: &[u8]) -> io::Result<u64> {
             payload.len()
         )));
     }
-    Ok(u64::from_le_bytes(payload[0..8].try_into().unwrap()))
+    read_u64_le_at(payload, 0, "IoBegin.req_id")
 }
 
 fn decode_io_decision(payload: &[u8]) -> io::Result<(u64, bool, u32)> {
     if payload.len() == 13 {
-        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let req_id = read_u64_le_at(payload, 0, "IoDecision.req_id")?;
         let allowed = match payload[8] {
             0 => false,
             1 => true,
             v => return Err(err_invalid(format!("invalid IoDecision.allowed {}", v))),
         };
-        let reason_code = u32::from_le_bytes(payload[9..13].try_into().unwrap());
+        let reason_code = read_u32_le_at(payload, 9, "IoDecision.reason")?;
         match reason_code {
             IO_REASON_ALLOWED
             | IO_REASON_DENIED_MISSING_CAPABILITY
@@ -313,13 +345,13 @@ fn decode_io_decision(payload: &[u8]) -> io::Result<(u64, bool, u32)> {
 
 fn decode_io_result(payload: &[u8]) -> io::Result<(u64, bool, u64, Option<u8>)> {
     if payload.len() == 18 {
-        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let req_id = read_u64_le_at(payload, 0, "IoResult.req_id")?;
         let success = match payload[8] {
             0 => false,
             1 => true,
             v => return Err(err_invalid(format!("invalid IoResult.success {}", v))),
         };
-        let size = u64::from_le_bytes(payload[9..17].try_into().unwrap());
+        let size = read_u64_le_at(payload, 9, "IoResult.size")?;
         let code = payload[17];
         let code_opt = if code == u8::MAX {
             None
@@ -332,13 +364,13 @@ fn decode_io_result(payload: &[u8]) -> io::Result<(u64, bool, u64, Option<u8>)> 
     }
 
     if payload.len() == 17 {
-        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+        let req_id = read_u64_le_at(payload, 0, "IoResult.req_id")?;
         let success = match payload[8] {
             0 => false,
             1 => true,
             v => return Err(err_invalid(format!("invalid IoResult.success {}", v))),
         };
-        let size = u64::from_le_bytes(payload[9..17].try_into().unwrap());
+        let size = read_u64_le_at(payload, 9, "IoResult.size")?;
         return Ok((req_id, success, size, None));
     }
 
@@ -353,7 +385,7 @@ fn decode_io_result(payload: &[u8]) -> io::Result<(u64, bool, u64, Option<u8>)> 
         1 => true,
         v => return Err(err_invalid(format!("invalid IoResult.success {}", v))),
     };
-    let size = u64::from_le_bytes(payload[1..9].try_into().unwrap());
+    let size = read_u64_le_at(payload, 1, "IoResult.size_legacy")?;
     match payload[0] {
         0 | 1 => Ok((0, success, size, None)),
         v => Err(err_invalid(format!("invalid IoResult.success {}", v))),
@@ -362,15 +394,15 @@ fn decode_io_result(payload: &[u8]) -> io::Result<(u64, bool, u64, Option<u8>)> 
 
 fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, u64, Option<&[u8]>)> {
     if payload.len() >= 25 {
-        let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-        let hash64 = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-        let size = u64::from_le_bytes(payload[16..24].try_into().unwrap());
+        let req_id = read_u64_le_at(payload, 0, "IoPayload.req_id")?;
+        let hash64 = read_u64_le_at(payload, 8, "IoPayload.hash64")?;
+        let size = read_u64_le_at(payload, 16, "IoPayload.size")?;
         let has_bytes = payload[24];
         if has_bytes == 0 && payload.len() == 25 {
             return Ok((req_id, hash64, size, None));
         }
         if has_bytes == 1 && payload.len() >= 29 {
-            let len = u32::from_le_bytes(payload[25..29].try_into().unwrap()) as usize;
+            let len = read_u32_le_at(payload, 25, "IoPayload.bytes_len")? as usize;
             if payload.len() == 29 + len {
                 return Ok((req_id, hash64, size, Some(&payload[29..])));
             }
@@ -384,8 +416,8 @@ fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, u64, Option<&[u8]>
         )));
     }
 
-    let hash64 = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let size = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let hash64 = read_u64_le_at(payload, 0, "IoPayload.hash64_legacy")?;
+    let size = read_u64_le_at(payload, 8, "IoPayload.size_legacy")?;
     let has_bytes = payload[16];
     match has_bytes {
         0 => {
@@ -404,7 +436,7 @@ fn decode_io_payload(payload: &[u8]) -> io::Result<(u64, u64, u64, Option<&[u8]>
                     payload.len()
                 )));
             }
-            let len = u32::from_le_bytes(payload[17..21].try_into().unwrap()) as usize;
+            let len = read_u32_le_at(payload, 17, "IoPayload.bytes_len_legacy")? as usize;
             if payload.len() != 21 + len {
                 return Err(err_invalid(format!(
                     "Bad IoPayload payload length mismatch: expected {}, got {}",
@@ -425,9 +457,9 @@ fn decode_bus_send(payload: &[u8]) -> io::Result<(u64, u32, u32)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let sender = u32::from_le_bytes(payload[8..12].try_into().unwrap());
-    let receiver = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "BusSend.req_id")?;
+    let sender = read_u32_le_at(payload, 8, "BusSend.sender")?;
+    let receiver = read_u32_le_at(payload, 12, "BusSend.receiver")?;
     Ok((req_id, sender, receiver))
 }
 
@@ -438,8 +470,8 @@ fn decode_bus_recv(payload: &[u8]) -> io::Result<(u64, u32)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let receiver = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "BusRecv.req_id")?;
+    let receiver = read_u32_le_at(payload, 8, "BusRecv.receiver")?;
     Ok((req_id, receiver))
 }
 
@@ -450,9 +482,9 @@ fn decode_bus_send_request(payload: &[u8]) -> io::Result<(u64, u32, u32)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let sender = u32::from_le_bytes(payload[8..12].try_into().unwrap());
-    let receiver = u32::from_le_bytes(payload[12..16].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "BusSendRequest.req_id")?;
+    let sender = read_u32_le_at(payload, 8, "BusSendRequest.sender")?;
+    let receiver = read_u32_le_at(payload, 12, "BusSendRequest.receiver")?;
     Ok((req_id, sender, receiver))
 }
 
@@ -463,7 +495,7 @@ fn decode_bus_decision(payload: &[u8]) -> io::Result<(u64, bool)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "BusDecision.req_id")?;
     let allowed = match payload[8] {
         0 => false,
         1 => true,
@@ -479,7 +511,7 @@ fn decode_bus_send_result(payload: &[u8]) -> io::Result<(u64, bool)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "BusSendResult.req_id")?;
     let ok = match payload[8] {
         0 => false,
         1 => true,
@@ -495,10 +527,10 @@ fn decode_channel_created(payload: &[u8]) -> io::Result<(u64, u64, u64, u64)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-    let schema_id = u64::from_le_bytes(payload[16..24].try_into().unwrap());
-    let limits_digest = u64::from_le_bytes(payload[24..32].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "ChannelCreated.req_id")?;
+    let channel_id = read_u64_le_at(payload, 8, "ChannelCreated.channel_id")?;
+    let schema_id = read_u64_le_at(payload, 16, "ChannelCreated.schema_id")?;
+    let limits_digest = read_u64_le_at(payload, 24, "ChannelCreated.limits_digest")?;
     Ok((req_id, channel_id, schema_id, limits_digest))
 }
 
@@ -509,8 +541,8 @@ fn decode_channel_closed(payload: &[u8]) -> io::Result<(u64, u64)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "ChannelClosed.req_id")?;
+    let channel_id = read_u64_le_at(payload, 8, "ChannelClosed.channel_id")?;
     Ok((req_id, channel_id))
 }
 
@@ -521,13 +553,13 @@ fn decode_message_sent(payload: &[u8]) -> io::Result<(u64, u64, u32, u64, u64, u
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-    let sender_id = u32::from_le_bytes(payload[16..20].try_into().unwrap());
-    let sender_seq = u64::from_le_bytes(payload[20..28].try_into().unwrap());
-    let schema_id = u64::from_le_bytes(payload[28..36].try_into().unwrap());
-    let hash64 = u64::from_le_bytes(payload[36..44].try_into().unwrap());
-    let size = u32::from_le_bytes(payload[44..48].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "MessageSent.req_id")?;
+    let channel_id = read_u64_le_at(payload, 8, "MessageSent.channel_id")?;
+    let sender_id = read_u32_le_at(payload, 16, "MessageSent.sender_id")?;
+    let sender_seq = read_u64_le_at(payload, 20, "MessageSent.sender_seq")?;
+    let schema_id = read_u64_le_at(payload, 28, "MessageSent.schema_id")?;
+    let hash64 = read_u64_le_at(payload, 36, "MessageSent.hash64")?;
+    let size = read_u32_le_at(payload, 44, "MessageSent.size")?;
     Ok((
         req_id, channel_id, sender_id, sender_seq, schema_id, hash64, size,
     ))
@@ -540,13 +572,13 @@ fn decode_message_delivered(payload: &[u8]) -> io::Result<(u64, u64, u32, u32, u
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-    let receiver_id = u32::from_le_bytes(payload[16..20].try_into().unwrap());
-    let sender_id = u32::from_le_bytes(payload[20..24].try_into().unwrap());
-    let sender_seq = u64::from_le_bytes(payload[24..32].try_into().unwrap());
-    let hash64 = u64::from_le_bytes(payload[32..40].try_into().unwrap());
-    let size = u32::from_le_bytes(payload[40..44].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "MessageDelivered.req_id")?;
+    let channel_id = read_u64_le_at(payload, 8, "MessageDelivered.channel_id")?;
+    let receiver_id = read_u32_le_at(payload, 16, "MessageDelivered.receiver_id")?;
+    let sender_id = read_u32_le_at(payload, 20, "MessageDelivered.sender_id")?;
+    let sender_seq = read_u64_le_at(payload, 24, "MessageDelivered.sender_seq")?;
+    let hash64 = read_u64_le_at(payload, 32, "MessageDelivered.hash64")?;
+    let size = read_u32_le_at(payload, 40, "MessageDelivered.size")?;
     Ok((
         req_id,
         channel_id,
@@ -565,9 +597,9 @@ fn decode_message_blocked(payload: &[u8]) -> io::Result<(u64, u64, u32)> {
             payload.len()
         )));
     }
-    let req_id = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let channel_id = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-    let receiver_id = u32::from_le_bytes(payload[16..20].try_into().unwrap());
+    let req_id = read_u64_le_at(payload, 0, "MessageBlocked.req_id")?;
+    let channel_id = read_u64_le_at(payload, 8, "MessageBlocked.channel_id")?;
+    let receiver_id = read_u32_le_at(payload, 16, "MessageBlocked.receiver_id")?;
     Ok((req_id, channel_id, receiver_id))
 }
 
@@ -578,8 +610,8 @@ fn decode_deadlock_detected(payload: &[u8]) -> io::Result<(u64, u32, u8)> {
             payload.len()
         )));
     }
-    let tick = u64::from_le_bytes(payload[0..8].try_into().unwrap());
-    let blocked = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+    let tick = read_u64_le_at(payload, 0, "DeadlockDetected.tick")?;
+    let blocked = read_u32_le_at(payload, 8, "DeadlockDetected.blocked")?;
     let kind = payload[12];
     if kind == 0 {
         return Err(err_invalid("invalid DeadlockDetected.kind 0"));
@@ -594,8 +626,8 @@ fn decode_deadlock_edge(payload: &[u8]) -> io::Result<(u32, u32, u8)> {
             payload.len()
         )));
     }
-    let from = u32::from_le_bytes(payload[0..4].try_into().unwrap());
-    let to = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+    let from = read_u32_le_at(payload, 0, "DeadlockEdge.from")?;
+    let to = read_u32_le_at(payload, 4, "DeadlockEdge.to")?;
     let reason = payload[8];
     match reason {
         1 | 2 | 3 => Ok((from, to, reason)),
@@ -1137,8 +1169,8 @@ pub fn verify_log_with_options<P: AsRef<Path>>(
                     )));
                 }
 
-                let parent = u64::from_le_bytes(ev.payload[0..8].try_into().unwrap());
-                let child = u64::from_le_bytes(ev.payload[8..16].try_into().unwrap());
+                let parent = read_u64_le_at(&ev.payload, 0, "TaskSpawned.parent")?;
+                let child = read_u64_le_at(&ev.payload, 8, "TaskSpawned.child")?;
 
                 if parent == child {
                     return Err(err_invalid(format!(
@@ -1258,7 +1290,7 @@ pub fn verify_log_with_options<P: AsRef<Path>>(
                     )));
                 }
 
-                let joined = u64::from_le_bytes(ev.payload[0..8].try_into().unwrap());
+                let joined = read_u64_le_at(&ev.payload, 0, "TaskJoined.joined")?;
 
                 let joiner = tasks.get(&ev.task_id).ok_or_else(|| {
                     err_invalid(format!(

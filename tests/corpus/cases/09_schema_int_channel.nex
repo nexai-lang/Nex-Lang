@@ -1,0 +1,6 @@
+fn main() {
+    bus.channel(7, "IntSchemaV1");
+    bus.send(7, "IntSchemaV1", "payload");
+    bus.recv(7);
+    return;
+}

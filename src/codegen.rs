@@ -647,6 +647,42 @@ fn generate_main(
     s.push_str("    rt.is_cancelled(task)\n");
     s.push_str("}\n\n");
 
+    s.push_str("fn fs_read(rt: &Arc<Runtime>, _task: u64, path_token: i64) -> i64 {\n");
+    s.push_str("    let synthetic_path = format!(\"/virtual/{}\", path_token);\n");
+    s.push_str("    match rt.fs_read(&synthetic_path) {\n");
+    s.push_str("        Ok(bytes) => bytes.len() as i64,\n");
+    s.push_str("        Err(_) => 0,\n");
+    s.push_str("    }\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn net_listen(_rt: &Arc<Runtime>, _task: u64, _port: i64) -> i64 {\n");
+    s.push_str("    0\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn fuel_consume(_rt: &Arc<Runtime>, _task: u64, _units: i64) -> i64 {\n");
+    s.push_str("    0\n");
+    s.push_str("}\n\n");
+
+    s.push_str(
+        "fn bus_channel(_rt: &Arc<Runtime>, _task: u64, _channel: i64, _schema: i64) -> i64 {\n",
+    );
+    s.push_str("    0\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn bus_send(rt: &Arc<Runtime>, task: u64, channel: i64, schema: i64, payload: i64) -> i64 {\n");
+    s.push_str("    let receiver = if channel < 0 { 0 } else { channel as u32 };\n");
+    s.push_str("    let seq = if schema < 0 { 0 } else { schema as u64 };\n");
+    s.push_str("    let kind = if payload < 0 { 0 } else { (payload as u64 & 0xffff) as u16 };\n");
+    s.push_str("    let _ = (task, receiver, seq, kind);\n");
+    s.push_str("    0\n");
+    s.push_str("}\n\n");
+
+    s.push_str("fn bus_recv(rt: &Arc<Runtime>, task: u64, channel: i64) -> i64 {\n");
+    s.push_str("    let receiver = if channel < 0 { 0 } else { channel as u32 };\n");
+    s.push_str("    let _ = (task, receiver);\n");
+    s.push_str("    0\n");
+    s.push_str("}\n\n");
+
     s.push_str("fn main() {\n");
     s.push_str("    let out_dir = std::env::var(\"NEX_OUT_DIR\")\n");
     s.push_str("        .ok()\n");

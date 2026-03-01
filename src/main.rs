@@ -10,7 +10,9 @@ mod bundle;
 mod checker;
 mod codegen;
 mod hir;
+mod ir_upgrade;
 mod lexer;
+mod mir;
 mod parser;
 mod replay;
 mod runtime;
@@ -28,6 +30,7 @@ fn main() -> Result<()> {
         eprintln!("  nex bundle <events.bin> --out <bundle.nexbundle>");
         eprintln!("  nex replay <events.bin> [--zero-trust]");
         eprintln!("  nex replay --bundle <bundle.nexbundle> [--zero-trust]");
+        eprintln!("  nex ir-upgrade <input.ir> --out <output.ir> [--kind hir|mir]");
         std::process::exit(1);
     }
 
@@ -35,6 +38,7 @@ fn main() -> Result<()> {
         "run" => cmd_run_cli(&args[2..]),
         "bundle" => cmd_bundle(&args[2..]),
         "replay" => cmd_replay(&args[2..]),
+        "ir-upgrade" => cmd_ir_upgrade(&args[2..]),
         other => {
             eprintln!("Unknown command: {other}");
             std::process::exit(1);
@@ -51,6 +55,12 @@ struct RunOptions<'a> {
     require_loop_fuel_checks: Option<bool>,
     recursion_limit: Option<u32>,
     deny_deadlock_risk: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct CompileIr {
+    hir: hir::types::Program,
+    mir: mir::types::Program,
 }
 
 fn cmd_run_cli(args: &[String]) -> Result<()> {
@@ -146,25 +156,34 @@ fn cmd_run(options: RunOptions<'_>) -> Result<()> {
 
     let program = parser::parse(&src).map_err(|e| anyhow::anyhow!(e))?;
     let hir_program = hir::lower_to_hir(&program);
+    let compile_ir = CompileIr {
+        mir: mir::lower_to_mir(&hir_program),
+        hir: hir_program,
+    };
+    let _mir_function_count = compile_ir.mir.functions.len();
     let check = checker::check(&program).map_err(|e| anyhow::anyhow!(e))?;
+    mir::check::check(&compile_ir.hir, &compile_ir.mir).map_err(|e| anyhow::anyhow!(e))?;
 
     if options.strict_determinism {
-        hir::analysis::determinism::enforce_strict_mode(&hir_program)
+        hir::analysis::determinism::enforce_strict_mode(&compile_ir.hir)
             .map_err(|e| anyhow::anyhow!(e))?;
     }
 
-    let capability_report = hir::analysis::capability_flow::analyze(&hir_program);
-    hir::analysis::capability_flow::enforce_declared_capabilities(&hir_program, &capability_report)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let capability_report = hir::analysis::capability_flow::analyze(&compile_ir.hir);
+    hir::analysis::capability_flow::enforce_declared_capabilities(
+        &compile_ir.hir,
+        &capability_report,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
 
-    let schema_report = hir::analysis::schema_validation::analyze(&hir_program);
+    let schema_report = hir::analysis::schema_validation::analyze(&compile_ir.hir);
     hir::analysis::schema_validation::enforce(&schema_report).map_err(|e| anyhow::anyhow!(e))?;
 
     let governancefacts_bytes =
         hir::analysis::governancefacts::encode_from_reports(&capability_report, &schema_report);
 
-    let cost_report = hir::analysis::cost_model::analyze(&hir_program);
-    let deadlock_report = hir::analysis::deadlock_risk::analyze(&hir_program);
+    let cost_report = hir::analysis::cost_model::analyze(&compile_ir.hir);
+    let deadlock_report = hir::analysis::deadlock_risk::analyze(&compile_ir.hir);
 
     for warning in &deadlock_report.warnings {
         eprintln!("warning: {}", warning);
@@ -255,6 +274,87 @@ fn emit_costfacts_artifact(out_dir: &Path, bytes: &[u8]) -> Result<()> {
     let path = out_dir.join("costfacts.bin");
     std::fs::write(&path, bytes)
         .with_context(|| format!("Failed to write costfacts artifact: {}", path.display()))
+}
+
+fn cmd_ir_upgrade(args: &[String]) -> Result<()> {
+    let mut input_path: Option<&str> = None;
+    let mut out_path: Option<&str> = None;
+    let mut kind: Option<ir_upgrade::IrKind> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --out"))?;
+                out_path = Some(value.as_str());
+            }
+            "--kind" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --kind"))?;
+                let parsed = match value.as_str() {
+                    "hir" => ir_upgrade::IrKind::Hir,
+                    "mir" => ir_upgrade::IrKind::Mir,
+                    _ => {
+                        return Err(anyhow::anyhow!(format!(
+                            "invalid --kind value: {} (expected: hir|mir)",
+                            value
+                        )));
+                    }
+                };
+                kind = Some(parsed);
+            }
+            v if v.starts_with("--") => {
+                return Err(anyhow::anyhow!(format!("unknown ir-upgrade option: {}", v)));
+            }
+            v => {
+                if input_path.is_some() {
+                    return Err(anyhow::anyhow!(format!(
+                        "unexpected extra ir-upgrade argument: {}",
+                        v
+                    )));
+                }
+                input_path = Some(v);
+            }
+        }
+        i += 1;
+    }
+
+    let input_path = input_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing input path for ir-upgrade (usage: nex ir-upgrade <input.ir> --out <output.ir> [--kind hir|mir])"
+        )
+    })?;
+
+    let out_path = out_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "missing --out path for ir-upgrade (usage: nex ir-upgrade <input.ir> --out <output.ir> [--kind hir|mir])"
+        )
+    })?;
+
+    let input_bytes = std::fs::read(input_path)
+        .with_context(|| format!("Failed to read ir-upgrade input: {}", input_path))?;
+
+    let upgraded = match kind {
+        Some(ir_upgrade::IrKind::Hir) => ir_upgrade::upgrade_hir_bytes(&input_bytes),
+        Some(ir_upgrade::IrKind::Mir) => ir_upgrade::upgrade_mir_bytes(&input_bytes),
+        None => ir_upgrade::upgrade_bytes_auto(&input_bytes),
+    }
+    .map_err(|e| anyhow::anyhow!(e))?;
+
+    std::fs::write(out_path, &upgraded.bytes)
+        .with_context(|| format!("Failed to write ir-upgrade output: {}", out_path))?;
+
+    println!("✅ IR UPGRADE OK");
+    println!("kind: {}", upgraded.kind.as_str());
+    println!("from_version: {}", upgraded.from_version);
+    println!("to_version: {}", upgraded.to_version);
+
+    Ok(())
 }
 
 fn cmd_bundle(args: &[String]) -> Result<()> {
@@ -464,7 +564,7 @@ fn policy_snapshot_bytes(check: &checker::CheckResult, governancefacts_bytes: &[
     out.push_str(&format!(
         ",\"ir\":{{\"hir_version\":{},\"mir_version\":{}}}",
         hir::HIR_VERSION,
-        hir::MIR_VERSION
+        mir::MIR_VERSION_V1
     ));
 
     out.push_str(&format!(
@@ -539,7 +639,7 @@ mod tests {
         let text = String::from_utf8(snapshot).expect("policy snapshot should be utf8");
 
         assert!(text.contains("\"hir_version\":1"));
-        assert!(text.contains("\"mir_version\":0"));
+        assert!(text.contains("\"mir_version\":1"));
 
         let expected_hash = hex_lower(&sha256_32(governancefacts));
         assert!(

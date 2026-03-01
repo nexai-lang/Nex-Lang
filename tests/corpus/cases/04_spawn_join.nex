@@ -1,0 +1,11 @@
+fn child() {
+    return;
+}
+
+fn main() !async {
+    let t = spawn {
+        child();
+    };
+    join(t);
+    return;
+}

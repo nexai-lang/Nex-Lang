@@ -1,0 +1,9 @@
+fn main() {
+    if false {
+        loop {
+            let x: int = 1;
+        }
+    } else {
+        return;
+    }
+}

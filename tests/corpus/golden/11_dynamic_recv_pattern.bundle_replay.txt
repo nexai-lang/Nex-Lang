@@ -1,0 +1,7 @@
+✅ REPLAY OK
+events_seen: 5
+run_finished_seq: 4
+exit_code: 0
+run_hash_hex: 63ef68d1767e596ec9ddf2abe62fe4c4ef748bd51afd700086b8bac6b42410d6
+cap_allowed_total: 0
+cap_denied_total: 0
