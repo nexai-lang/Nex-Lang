@@ -1,10 +1,7 @@
 # NEX 🚀
 **Governed Deterministic Execution Kernel for Multi-Agent Systems**
 
-[![Build Status]](#)
-[![License]](#)
-[![Version]](#)
-[![Rust]](#)
+
 
 ---
 
